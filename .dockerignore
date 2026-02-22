@@ -1,0 +1,15 @@
+# Не копировать в образ
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.md
+Dockerfile
+.dockerignore
+docker-compose*.yml
+telegram-bot
+*.exe
+.idea
+.vscode
+.DS_Store

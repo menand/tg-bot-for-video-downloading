@@ -1,0 +1,21 @@
+# Бинарники
+telegram-bot
+*.exe
+
+# Зависимости
+vendor/
+
+# Переменные окружения (никогда не коммить токены!)
+.env
+.env.local
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

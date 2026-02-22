@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Либо задать токен явно (не коммитить!):
+    # environment:
+    #   TELEGRAM_BOT_TOKEN: "твой_токен"
