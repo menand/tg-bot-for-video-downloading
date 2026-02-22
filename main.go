@@ -48,6 +48,10 @@ var urlRegex = regexp.MustCompile(`https?://[^\s]+`)
 // Нужно для команды /uptime, чтобы показать пользователю, сколько времени бот работает.
 var startTime time.Time
 
+// videoDuration хранит длительность последнего скачанного видео
+// Нужно, чтобы передать информацию из downloadVideo в handleVideoURL
+var videoDuration time.Duration
+
 // ============================================================================
 // ФУНКЦИИ ДЛЯ РАБОТЫ С КОНФИГУРАЦИЕЙ
 // ============================================================================
@@ -272,6 +276,9 @@ type VideoInfo struct {
 //   - chatID: ID чата пользователя (куда отправлять ответ)
 //   - url: ссылка на видео, которую нужно скачать
 func handleVideoURL(bot *telegram.BotAPI, chatID int64, url string) {
+	// Сбрасываем длительность предыдущего видео
+	videoDuration = 0
+
 	// Засекаем время начала скачивания
 	startTime := time.Now()
 
@@ -314,8 +321,14 @@ func handleVideoURL(bot *telegram.BotAPI, chatID int64, url string) {
 		return
 	}
 
-	// Шаг 6: Получаем дополнительную информацию о видео (длительность)
-	duration := getVideoDuration(filePath)
+	// Шаг 6: Получаем длительность видео
+	// Мы уже получили её при скачивании через yt-dlp (из JSON-метаданных)
+	duration := videoDuration
+
+	// Если по какой-то причине длительность не получена — пробуем через ffprobe
+	if duration == 0 {
+		duration = getVideoDuration(filePath)
+	}
 
 	// Формируем подпись для файла
 	filename := filepath.Base(filePath)
@@ -352,14 +365,14 @@ func formatFileSize(bytes int64) string {
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
 	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
+	size := float64(bytes)
+	units := []string{"B", "KB", "MB", "GB", "TB"} // можно расширить
+	exp := 0
+	for size >= unit && exp < len(units)-1 {
+		size /= unit
 		exp++
 	}
-	// Названия единиц: B, KB, MB, GB
-	units := []string{"B", "KB", "MB", "GB"}
-	return fmt.Sprintf("%.1f %s", float64(bytes)/float64(div), units[exp])
+	return fmt.Sprintf("%.1f %s", size, units[exp])
 }
 
 // formatDuration преобразует длительность в читаемый вид
@@ -429,12 +442,49 @@ func downloadVideo(url string) (string, error) {
 		return "", err // Возвращаем пустую строку и ошибку
 	}
 
-	// Формируем путь для сохранения файла
-	// %(ext)s — это плейсхолдер, который yt-dlp заменит на реальное расширение файла
-	// Например, video.mp4, video.webm и т.д.
-	outPath := filepath.Join(dir, "video.%(ext)s")
+	// Шаг 3: Сначала получаем метаданные видео (заголовок, длительность)
+	// Используем --dump-json для получения информации в JSON-формате
+	// Это позволяет узнать название видео перед скачиванием
+	cmdInfo := exec.Command(ytDlp,
+		"--no-playlist",
+		"--dump-json",
+		"--no-warnings",
+		"--no-call-home",
+		url,
+	)
+	infoOutput, err := cmdInfo.Output()
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("не удалось получить информацию о видео: %v", err)
+	}
 
-	// Шаг 3: Формируем команду для yt-dlp с нужными параметрами
+	// Парсим JSON-ответ
+	// Ищем поля "title" и "duration" в JSON
+	jsonStr := string(infoOutput)
+	title := extractJSONString(jsonStr, "title")
+	duration := extractJSONFloat(jsonStr, "duration")
+
+	// Если не удалось получить title — используем случайное имя
+	if title == "" {
+		title = "video"
+	}
+
+	// Очищаем название от недопустимых символов для имени файла
+	// Оставляем только буквы, цифры, дефисы, подчёркивания и пробелы
+	title = sanitizeFilename(title)
+
+	// Сохраняем длительность в глобальную переменную для использования при отправке
+	// Это нужно, так как функция возвращает только путь к файлу
+	if duration > 0 {
+		videoDuration = time.Duration(duration * float64(time.Second))
+	}
+
+	// Формируем путь для сохранения файла с использованием названия видео
+	// %(title).100s — обрезаем название до 100 символов, чтобы не было слишком длинных имён
+	// %(ext)s — расширение файла
+	outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
+
+	// Шаг 4: Формируем команду для yt-dlp с нужными параметрами
 	//
 	// Параметры yt-dlp:
 	//   --no-playlist        Не скачивать весь плейлист, только одно видео
@@ -461,11 +511,11 @@ func downloadVideo(url string) (string, error) {
 	// Устанавливаем рабочую директорию для команды
 	cmd.Dir = dir
 
-	// Шаг 4: Запускаем команду и ждём результат
+	// Шаг 5: Запускаем команду и ждём результат
 	// CombinedOutput возвращает stdout + stderr (всё, что команда вывела в консоль)
 	out, err := cmd.CombinedOutput()
 
-	// Шаг 5: Обрабатываем ошибку скачивания
+	// Шаг 6: Обрабатываем ошибку скачивания
 	if err != nil {
 		// Удаляем временную папку, так как она больше не нужна
 		os.RemoveAll(dir)
@@ -491,8 +541,8 @@ func downloadVideo(url string) (string, error) {
 		return "", err
 	}
 
-	// Шаг 6: Ищем скачанный файл
-	// yt-dlp создаёт файл с реальным расширением вместо %(ext)s
+	// Шаг 7: Ищем скачанный файл
+	// yt-dlp создаёт файл с реальным названием и расширением
 	entries, _ := os.ReadDir(dir) // Читаем содержимое временной папки
 
 	// Проходим по всем файлам в папке
@@ -506,4 +556,64 @@ func downloadVideo(url string) (string, error) {
 	// Если файлов не нашлось (странная ситуация) — возвращаем ошибку
 	os.RemoveAll(dir)
 	return "", os.ErrNotExist
+}
+
+// sanitizeFilename очищает строку от недопустимых символов в имени файла
+// Оставляет только безопасные символы: буквы, цифры, пробелы, дефисы, подчёркивания
+func sanitizeFilename(name string) string {
+	// Создаём "белый список" допустимых символов
+	// Буквы (латиница + кириллица), цифры, пробел, дефис, подчёркивание, точка
+	allowed := func(r rune) bool {
+		return (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= 'а' && r <= 'я') ||
+			(r >= 'А' && r <= 'Я') ||
+			(r >= '0' && r <= '9') ||
+			r == ' ' || r == '-' || r == '_' || r == '.'
+	}
+
+	// Фильтруем каждый символ
+	result := strings.Map(func(r rune) rune {
+		if allowed(r) {
+			return r
+		}
+		return -1 // Удаляем символ
+	}, name)
+
+	// Убираем лишние пробелы по краям
+	result = strings.TrimSpace(result)
+
+	// Если после очистки строка пустая — возвращаем "video"
+	if result == "" {
+		return "video"
+	}
+
+	return result
+}
+
+// extractJSONString ищет значение строкового поля в JSON-выводе yt-dlp
+// Простой парсинг без внешних библиотек
+func extractJSONString(json, field string) string {
+	// Ищем "field":"value" или "field": "value"
+	pattern := fmt.Sprintf(`"%s":\s*"([^"]*)"`, field)
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(json)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+// extractJSONFloat ищет значение числового поля (duration) в JSON-выводе yt-dlp
+func extractJSONFloat(json, field string) float64 {
+	// Ищем "field":123.45
+	pattern := fmt.Sprintf(`"%s":\s*([0-9.]+)`, field)
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(json)
+	if len(matches) > 1 {
+		var val float64
+		fmt.Sscanf(matches[1], "%f", &val)
+		return val
+	}
+	return 0
 }
