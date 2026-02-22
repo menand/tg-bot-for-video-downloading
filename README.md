@@ -69,7 +69,7 @@ git clone <url> telegram-bot && cd telegram-bot
 echo 'TELEGRAM_BOT_TOKEN=твой_токен' > .env
 
 # Сборка и запуск в фоне, с автоперезапуском
-docker compose up -d --build
+docker-compose down && docker-compose up -d --build
 
 # Логи
 docker compose logs -f bot
