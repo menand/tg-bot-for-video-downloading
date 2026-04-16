@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -28,6 +30,7 @@ const (
 	maxCaptionLen          = 1024
 	downloadTimeout        = 10 * time.Minute
 	maxConcurrentDownloads = 3
+	maxLogSize             = 5 * 1024 * 1024
 )
 
 var (
@@ -35,6 +38,7 @@ var (
 	startTime    time.Time
 	adminChatID  int64
 	shutdownFunc context.CancelFunc
+	logPath      = "bot.log"
 
 	statsDownloads int64
 	statsErrors    int64
@@ -51,6 +55,56 @@ type videoInfo struct {
 }
 
 var downloadSem = make(chan struct{}, maxConcurrentDownloads)
+
+type rotatingLogWriter struct {
+	mu   sync.Mutex
+	file *os.File
+	path string
+}
+
+func newRotatingLogWriter(path string) (*rotatingLogWriter, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &rotatingLogWriter{file: f, path: path}, nil
+}
+
+func (w *rotatingLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	info, err := w.file.Stat()
+	if err != nil {
+		return w.file.Write(p)
+	}
+
+	if info.Size()+int64(len(p)) > maxLogSize {
+		w.file.Close()
+		data, err := os.ReadFile(w.path)
+		if err != nil {
+			w.file, _ = os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			return w.file.Write(p)
+		}
+		keep := len(data) / 2
+		for keep < len(data) && data[keep] != '\n' {
+			keep++
+		}
+		if keep < len(data) {
+			keep++
+		}
+		w.file, _ = os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		w.file.Write(data[keep:])
+	}
+
+	return w.file.Write(p)
+}
+
+func (w *rotatingLogWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Close()
+}
 
 func loadEnvFile() {
 	f, err := os.Open(".env")
@@ -97,6 +151,14 @@ func currentDownloads() int {
 func main() {
 	loadEnvFile()
 
+	logWriter, err := newRotatingLogWriter(logPath)
+	if err != nil {
+		log.Fatalf("Ошибка создания лог-файла: %v", err)
+	}
+	defer logWriter.Close()
+	log.SetOutput(io.MultiWriter(os.Stderr, logWriter))
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" {
 		log.Fatal("Установите TELEGRAM_BOT_TOKEN в файле .env или в переменной окружения")
@@ -124,15 +186,15 @@ func main() {
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/help", bot.MatchTypeExact, helpCmd)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/hello", bot.MatchTypeExact, helloCmd)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/uptime", bot.MatchTypeExact, uptimeCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/myid", bot.MatchTypeExact, myidCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/uptime", bot.MatchTypeExact, uptimeCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/stats", bot.MatchTypeExact, statsCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/status", bot.MatchTypeExact, statusCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/shutdown", bot.MatchTypeExact, shutdownCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/log", bot.MatchTypeExact, logCmd)
 
 	startTime = time.Now()
-	log.Printf("Бот запущен (admin=%d)", adminChatID)
+	log.Printf("Бот запущен (admin=%d, yt-dlp=%s)", adminChatID, ytDlpVersion())
 
 	b.Start(ctx)
 	log.Println("Бот остановлен")
@@ -145,17 +207,29 @@ func senderID(update *models.Update) int64 {
 	return 0
 }
 
+func senderName(update *models.Update) string {
+	if update.Message != nil && update.Message.From != nil {
+		name := update.Message.From.FirstName
+		if update.Message.From.LastName != "" {
+			name += " " + update.Message.From.LastName
+		}
+		return name
+	}
+	return "unknown"
+}
+
 func startCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	log.Printf("[cmd] /start от %s (id=%d)", senderName(update), senderID(update))
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
-		Text:   "Привет! Я умею скачивать видео. Отправь ссылку на YouTube, VK, Instagram, TikTok или другой сайт — пришлю видео.\n\n/help — справка\n/uptime — время работы бота",
+		Text:   "Привет! Я умею скачивать видео. Отправь ссылку на YouTube, VK, Instagram, TikTok или другой сайт — пришлю видео.\n\n/help — справка",
 	})
 }
 
 func helpCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
-	text := "Доступные команды:\n/start — приветствие\n/help — эта справка\n/hello — поздороваться\n/uptime — время работы бота\n/myid — узнать свой Telegram ID\n\nИли отправь ссылку на видео — скачаю и пришлю файл."
+	text := "Доступные команды:\n/help — справка\n/myid — узнать свой Telegram ID\n/start — приветствие\n\nИли отправь ссылку на видео — скачаю и пришлю файл."
 	if isAdmin(senderID(update)) {
-		text += "\n\nАдмин-команды:\n/stats — статистика скачиваний\n/status — текущее состояние\n/shutdown — остановить бота"
+		text += "\n\nАдмин-команды:\n/log — получить лог-файл\n/shutdown — остановить бота\n/stats — статистика скачиваний\n/status — текущее состояние\n/uptime — время работы бота"
 	}
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -163,18 +237,10 @@ func helpCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 	})
 }
 
-func helloCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
-	name := "друг"
-	if update.Message.From != nil && update.Message.From.FirstName != "" {
-		name = update.Message.From.FirstName
-	}
-	b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   "Привет, " + name + "!",
-	})
-}
-
 func uptimeCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if !isAdmin(senderID(update)) {
+		return
+	}
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   formatUptime(time.Since(startTime)),
@@ -182,6 +248,7 @@ func uptimeCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 }
 
 func myidCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	log.Printf("[cmd] /myid от %s (id=%d)", senderName(update), senderID(update))
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   fmt.Sprintf("Твой Telegram ID: %d", senderID(update)),
@@ -226,6 +293,44 @@ func shutdownCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 	shutdownFunc()
 }
 
+func logCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if !isAdmin(senderID(update)) {
+		return
+	}
+	log.Printf("[cmd] /log запрошен админом")
+
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   fmt.Sprintf("Ошибка чтения лога: %v", err),
+		})
+		return
+	}
+
+	if len(content) == 0 {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   "Лог-файл пуст.",
+		})
+		return
+	}
+
+	filename := fmt.Sprintf("bot-%s.log", time.Now().Format("2006-01-02_15-04-05"))
+	_, err = b.SendDocument(ctx, &bot.SendDocumentParams{
+		ChatID:   update.Message.Chat.ID,
+		Document: &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(content)},
+		Caption:  fmt.Sprintf("Лог бота (%s)", formatFileSize(int64(len(content)))),
+	})
+	if err != nil {
+		log.Printf("Ошибка отправки лога: %v", err)
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   fmt.Sprintf("Не удалось отправить лог-файл: %v", err),
+		})
+	}
+}
+
 func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	if update.Message == nil {
 		return
@@ -237,10 +342,12 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 
 	if url := extractFirstURL(text); url != "" {
+		log.Printf("[url] %s запросил скачивание: %s", senderName(update), url)
 		go handleVideoURL(ctx, b, update.Message.Chat.ID, url)
 		return
 	}
 
+	log.Printf("[msg] от %s (id=%d): %q", senderName(update), senderID(update), text)
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   "Отправь ссылку на видео (YouTube, VK, Instagram, TikTok и др.) — я скачаю и пришлю файл. Или используй /help.",
@@ -308,6 +415,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	select {
 	case downloadSem <- struct{}{}:
 	default:
+		log.Printf("[download] отклонён: semaphore полон (url=%s)", url)
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   "Слишком много одновременных скачиваний, попробуй позже.",
@@ -315,6 +423,8 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		return
 	}
 	defer func() { <-downloadSem }()
+
+	log.Printf("[download] начало: url=%s", url)
 
 	statusMsg, _ := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
@@ -329,7 +439,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	if err != nil {
 		atomic.AddInt64(&statsErrors, 1)
-		log.Printf("Ошибка скачивания %s: %v", url, err)
+		log.Printf("[download] ошибка: url=%s за=%s err=%v", url, downloadDuration.Round(time.Millisecond), err)
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   "Не удалось скачать видео. Проверь ссылку и доступность ролика (приватное, регион и т.д.).",
@@ -354,7 +464,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	info, err := os.Stat(result.filePath)
 	if err != nil {
-		log.Printf("Ошибка получения информации о файле: %v", err)
+		log.Printf("[download] ошибка stat: url=%s err=%v", url, err)
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   "Не удалось получить информацию о файле.",
@@ -362,7 +472,12 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		return
 	}
 
+	log.Printf("[download] файл: url=%s name=%s size=%s duration=%s за=%s",
+		url, filepath.Base(result.filePath), formatFileSize(info.Size()),
+		formatDuration(result.duration), downloadDuration.Round(time.Millisecond))
+
 	if info.Size() > maxFileSizeMB*1024*1024 {
+		log.Printf("[download] файл слишком большой: url=%s size=%s", url, formatFileSize(info.Size()))
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   "Файл получился больше 50 МБ — Telegram не примет такой размер. Попробуй другую ссылку или качество.",
@@ -388,7 +503,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	fileContent, err := os.ReadFile(result.filePath)
 	if err != nil {
-		log.Printf("Ошибка чтения файла: %v", err)
+		log.Printf("[download] ошибка чтения файла: url=%s err=%v", url, err)
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   "Не удалось прочитать скачанный файл.",
@@ -403,19 +518,21 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	})
 
 	if sendErr != nil {
-		log.Printf("Отправка как видео не удалась: %v, пробую как документ", sendErr)
+		log.Printf("[send] видео не ушло: url=%s err=%v, пробую документом", url, sendErr)
 		_, docErr := b.SendDocument(ctx, &bot.SendDocumentParams{
 			ChatID:   chatID,
 			Document: &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(fileContent)},
 			Caption:  caption,
 		})
 		if docErr != nil {
-			log.Printf("Ошибка отправки файла: %v", docErr)
+			log.Printf("[send] документ не ушёл: url=%s err=%v", url, docErr)
 			b.SendMessage(ctx, &bot.SendMessageParams{
 				ChatID: chatID,
 				Text:   "Скачал файл, но не получилось отправить.",
 			})
 		}
+	} else {
+		log.Printf("[send] успешно: url=%s size=%s", url, sizeStr)
 	}
 }
 
@@ -468,13 +585,13 @@ func getVideoDuration(filePath string) time.Duration {
 	)
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("Ошибка получения длительности: %v", err)
+		log.Printf("[ffprobe] ошибка: file=%s err=%v", filePath, err)
 		return 0
 	}
 
 	var seconds float64
 	if _, err := fmt.Sscanf(string(output), "%f", &seconds); err != nil {
-		log.Printf("Ошибка парсинга длительности: %v", err)
+		log.Printf("[ffprobe] ошибка парсинга: file=%s output=%q err=%v", filePath, strings.TrimSpace(string(output)), err)
 		return 0
 	}
 
@@ -492,6 +609,8 @@ func downloadVideo(url string) (*downloadResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
 	defer cancel()
 
+	log.Printf("[yt-dlp] получение информации: url=%s", url)
+
 	cmdInfo := exec.CommandContext(ctx, ytDlp,
 		"--no-playlist",
 		"--dump-json",
@@ -502,15 +621,18 @@ func downloadVideo(url string) (*downloadResult, error) {
 	infoOutput, err := cmdInfo.Output()
 	if err != nil {
 		os.RemoveAll(dir)
+		log.Printf("[yt-dlp] dump-json ошибка: url=%s err=%v", url, err)
 		return nil, fmt.Errorf("не удалось получить информацию о видео: %v", err)
 	}
 
 	var vi videoInfo
 	if err := json.Unmarshal(infoOutput, &vi); err != nil {
-		log.Printf("Ошибка парсинга JSON от yt-dlp: %v", err)
+		log.Printf("[yt-dlp] парсинг JSON ошибка: url=%s err=%v", url, err)
 		vi.Title = ""
 		vi.Duration = 0
 	}
+
+	log.Printf("[yt-dlp] информация: url=%s title=%q duration=%.1fs", url, vi.Title, vi.Duration)
 
 	title := vi.Title
 	if title == "" {
@@ -523,8 +645,6 @@ func downloadVideo(url string) (*downloadResult, error) {
 		duration = time.Duration(vi.Duration * float64(time.Second))
 	}
 
-	outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
-
 	formats := []string{
 		"best[ext=mp4][filesize<50M]/best[filesize<50M]",
 		"best[ext=mp4][height<=720][filesize<50M]/best[height<=720][filesize<50M]",
@@ -534,10 +654,12 @@ func downloadVideo(url string) (*downloadResult, error) {
 	}
 
 	var lastErr error
-	for _, format := range formats {
+	for i, format := range formats {
 		os.RemoveAll(dir)
-		os.MkdirTemp("", "") // ensure dir state
 		dir, _ = os.MkdirTemp("", "tg-video-*")
+		outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
+
+		log.Printf("[yt-dlp] попытка %d/%d: url=%s format=%s", i+1, len(formats), url, format)
 
 		cmd := exec.CommandContext(ctx, ytDlp,
 			"--no-playlist",
@@ -555,7 +677,7 @@ func downloadVideo(url string) (*downloadResult, error) {
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			raw := strings.TrimSpace(string(out))
-			log.Printf("[yt-dlp] URL=%s format=%s err=%v\n[yt-dlp] вывод:\n%s", url, format, err, raw)
+			log.Printf("[yt-dlp] попытка %d неудача: url=%s format=%s err=%v вывод=%q", i+1, url, format, err, truncateStr(raw, 500))
 			lastErr = err
 			continue
 		}
@@ -563,9 +685,14 @@ func downloadVideo(url string) (*downloadResult, error) {
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
 			if !e.IsDir() {
+				fi, _ := e.Info()
+				log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
+					i+1, url, format, e.Name(), formatFileSize(fi.Size()))
 				return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration}, nil
 			}
 		}
+
+		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
 	}
 
 	os.RemoveAll(dir)
@@ -573,6 +700,13 @@ func downloadVideo(url string) (*downloadResult, error) {
 		return nil, fmt.Errorf("ошибка скачивания (все качества)")
 	}
 	return nil, os.ErrNotExist
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
 }
 
 func sanitizeFilename(name string) string {
