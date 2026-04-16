@@ -47,11 +47,15 @@ var (
 type downloadResult struct {
 	filePath string
 	duration time.Duration
+	width    int
+	height   int
 }
 
 type videoInfo struct {
 	Title    string  `json:"title"`
 	Duration float64 `json:"duration"`
+	Height   int     `json:"height"`
+	Width    int     `json:"width"`
 }
 
 var downloadSem = make(chan struct{}, maxConcurrentDownloads)
@@ -495,8 +499,13 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	durationStr := formatDuration(duration)
 	downloadTimeStr := formatDuration(downloadDuration)
 
-	caption := fmt.Sprintf("📹 %s\n⏱ Длительность: %s\n💾 Размер: %s\n⚡ Обработано за: %s",
-		filename, durationStr, sizeStr, downloadTimeStr)
+	resStr := ""
+	if result.width > 0 && result.height > 0 {
+		resStr = fmt.Sprintf("\n🖥 Разрешение: %dx%d", result.width, result.height)
+	}
+
+	caption := fmt.Sprintf("📹 %s\n⏱ Длительность: %s%s\n💾 Размер: %s\n⚡ Обработано за: %s",
+		filename, durationStr, resStr, sizeStr, downloadTimeStr)
 	if len(caption) > maxCaptionLen {
 		caption = caption[:maxCaptionLen]
 	}
@@ -688,7 +697,7 @@ func downloadVideo(url string) (*downloadResult, error) {
 				fi, _ := e.Info()
 				log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
 					i+1, url, format, e.Name(), formatFileSize(fi.Size()))
-				return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration}, nil
+				return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration, width: vi.Width, height: vi.Height}, nil
 			}
 		}
 
