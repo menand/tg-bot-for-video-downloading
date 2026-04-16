@@ -525,35 +525,53 @@ func downloadVideo(url string) (*downloadResult, error) {
 
 	outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
 
-	cmd := exec.CommandContext(ctx, ytDlp,
-		"--no-playlist",
-		"-f", "best[ext=mp4]/best",
-		"--merge-output-format", "mp4",
-		"--max-filesize", "50M",
-		"-o", outPath,
-		"--no-warnings",
-		"--no-call-home",
-		"--user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:131.0) Gecko/20100101 Firefox/131.0",
-		url,
-	)
-	cmd.Dir = dir
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		os.RemoveAll(dir)
-		raw := strings.TrimSpace(string(out))
-		log.Printf("[yt-dlp] URL=%s err=%v\n[yt-dlp] полный вывод:\n%s", url, err, raw)
-		return nil, fmt.Errorf("ошибка скачивания")
+	formats := []string{
+		"best[ext=mp4][filesize<50M]/best[filesize<50M]",
+		"best[ext=mp4][height<=720][filesize<50M]/best[height<=720][filesize<50M]",
+		"best[ext=mp4][height<=480]/best[height<=480]",
+		"best[ext=mp4][height<=360]/best[height<=360]",
+		"best[ext=mp4]/best",
 	}
 
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if !e.IsDir() {
-			return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration}, nil
+	var lastErr error
+	for _, format := range formats {
+		os.RemoveAll(dir)
+		os.MkdirTemp("", "") // ensure dir state
+		dir, _ = os.MkdirTemp("", "tg-video-*")
+
+		cmd := exec.CommandContext(ctx, ytDlp,
+			"--no-playlist",
+			"-f", format,
+			"--merge-output-format", "mp4",
+			"--max-filesize", "50M",
+			"-o", outPath,
+			"--no-warnings",
+			"--no-call-home",
+			"--user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:131.0) Gecko/20100101 Firefox/131.0",
+			url,
+		)
+		cmd.Dir = dir
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			raw := strings.TrimSpace(string(out))
+			log.Printf("[yt-dlp] URL=%s format=%s err=%v\n[yt-dlp] вывод:\n%s", url, format, err, raw)
+			lastErr = err
+			continue
+		}
+
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if !e.IsDir() {
+				return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration}, nil
+			}
 		}
 	}
 
 	os.RemoveAll(dir)
+	if lastErr != nil {
+		return nil, fmt.Errorf("ошибка скачивания (все качества)")
+	}
 	return nil, os.ErrNotExist
 }
 
