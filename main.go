@@ -38,7 +38,7 @@ var (
 	startTime    time.Time
 	adminChatID  int64
 	shutdownFunc context.CancelFunc
-	logPath      = "bot.log"
+	logPath      = "/tmp/bot.log"
 
 	statsDownloads int64
 	statsErrors    int64

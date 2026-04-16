@@ -102,6 +102,9 @@ docker compose restart bot
 
 # Остановка
 docker compose down
+
+# Обновить
+git pull && docker compose down && docker-compose up -d --build
 ```
 
 Версия yt-dlp пиннится в Dockerfile (`YT_DLP_VERSION`), обновляй вручную.
