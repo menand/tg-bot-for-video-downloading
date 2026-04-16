@@ -1,411 +1,447 @@
-// Пакет main — точка входа в программу.
-// Это Telegram-бот для скачивания видео с различных сайтов (YouTube, VK, Instagram, TikTok и др.)
 package main
 
-// Импортируем нужные библиотеки:
-// - bufio: чтение файла построчно
-// - fmt: форматирование строк (аналог printf)
-// - log: логирование (вывод в консоль)
-// - os: работа с файлами и переменными окружения
-// - os/exec: запуск внешних команд (yt-dlp)
-// - path/filepath: работа с путями к файлам
-// - regexp: работа с регулярными выражениями (поиск URL в тексте)
-// - strings: работа со строками
-// - time: работа со временем (таймеры, длительность)
-// - telegram: библиотека для работы с Telegram Bot API
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
+	"unicode"
 
-	telegram "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 )
 
-// ============================================================================
-// КОНСТАНТЫ И ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-// ============================================================================
+const (
+	maxFileSizeMB          = 50
+	maxCaptionLen          = 1024
+	downloadTimeout        = 10 * time.Minute
+	maxConcurrentDownloads = 3
+)
 
-// Максимальный размер файла в мегабайтах, который Telegram позволяет отправить.
-// Telegram имеет ограничение в 50 МБ, поэтому мы заранее не скачиваем файлы больше этого размера.
-const maxFileSizeMB = 50
+var (
+	urlRegex     = regexp.MustCompile(`https?://[^\s]+`)
+	startTime    time.Time
+	adminChatID  int64
+	shutdownFunc context.CancelFunc
 
-// Максимальная длина сообщения об ошибке в Telegram.
-// Telegram позволяет сообщения до 4096 символов, оставляем небольшой запас.
-const maxErrorMsgLen = 3500
+	statsDownloads int64
+	statsErrors    int64
+)
 
-// Регулярное выражение (шаблон) для поиска URL в тексте.
-// Ищет текст, начинающийся с "http://" или "https://" до первого пробела или конца строки.
-// Пример: найдёт "https://youtube.com/watch?v=abc" внутри любого текста.
-var urlRegex = regexp.MustCompile(`https?://[^\s]+`)
+type downloadResult struct {
+	filePath string
+	duration time.Duration
+}
 
-// Время запуска бота.
-// Нужно для команды /uptime, чтобы показать пользователю, сколько времени бот работает.
-var startTime time.Time
+type videoInfo struct {
+	Title    string  `json:"title"`
+	Duration float64 `json:"duration"`
+}
 
-// videoDuration хранит длительность последнего скачанного видео
-// Нужно, чтобы передать информацию из downloadVideo в handleVideoURL
-var videoDuration time.Duration
+var downloadSem = make(chan struct{}, maxConcurrentDownloads)
 
-// ============================================================================
-// ФУНКЦИИ ДЛЯ РАБОТЫ С КОНФИГУРАЦИЕЙ
-// ============================================================================
-
-// loadTokenFromEnvFile читает токен бота из файла .env
-// Файл .env — это текстовый файл, где каждая строка имеет формат: КЛЮЧ=ЗНАЧЕНИЕ
-// Пример содержимого .env:
-//
-//	TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-//
-// Возвращает токен бота или пустую строку, если файл не найден/некорректен.
-func loadTokenFromEnvFile() string {
-	// Открываем файл .env для чтения
+func loadEnvFile() {
 	f, err := os.Open(".env")
 	if err != nil {
-		// Файла нет — это нормально, попробуем другой способ
-		return ""
+		return
 	}
-	// defer гарантирует, что файл закроется при выходе из функции (даже при ошибке)
 	defer f.Close()
 
-	// Создаём сканер для построчного чтения файла
 	sc := bufio.NewScanner(f)
-
-	// Читаем файл построчно
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text()) // Убираем пробелы в начале и конце строки
-
-		// Пропускаем пустые строки и комментарии (начинающиеся с #)
+		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
-		// Ищем знак "=" — разделитель между ключом и значением
 		idx := strings.Index(line, "=")
 		if idx <= 0 {
-			continue // Нет "=" или "=" в начале строки — некорректная строка
+			continue
 		}
-
-		// Извлекаем ключ (часть до "=") и значение (часть после "=")
 		key := strings.TrimSpace(line[:idx])
-		if key != "TELEGRAM_BOT_TOKEN" {
-			continue // Это не токен бота, пропускаем
-		}
-
-		// Получаем значение и убираем лишние кавычки (если есть)
 		val := strings.TrimSpace(line[idx+1:])
-		val = strings.Trim(val, `"'`) // Убирает двойные и одинарные кавычки по краям
+		val = strings.Trim(val, `"'`)
 
-		return val // Нашли токен, возвращаем его
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
 	}
-
-	// Токен не найден в файле
-	return ""
 }
 
-// ============================================================================
-// ГЛАВНАЯ ФУНКЦИЯ — точка входа в программу
-// ============================================================================
+func ytDlpBin() string {
+	if bin := os.Getenv("YT_DLP_BIN"); bin != "" {
+		return bin
+	}
+	return "yt-dlp"
+}
+
+func isAdmin(userID int64) bool {
+	return adminChatID != 0 && userID == adminChatID
+}
+
+func currentDownloads() int {
+	return len(downloadSem)
+}
 
 func main() {
-	// Шаг 1: Получаем токен бота
-	// Сначала пробуем получить из переменной окружения (для Docker/сервера)
+	loadEnvFile()
+
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-
-	// Если нет в переменной окружения — пробуем прочитать из файла .env
-	if token == "" {
-		token = loadTokenFromEnvFile()
-	}
-
-	// Если токен так и не получили — выходим с ошибкой
 	if token == "" {
 		log.Fatal("Установите TELEGRAM_BOT_TOKEN в файле .env или в переменной окружения")
 	}
 
-	// Шаг 2: Создаём объект бота через Telegram Bot API
-	bot, err := telegram.NewBotAPI(token)
+	adminChatID, _ = strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	shutdownFunc = cancel
+
+	opts := []bot.Option{
+		bot.WithDefaultHandler(defaultHandler),
+		bot.WithWorkers(10),
+	}
+
+	if os.Getenv("BOT_DEBUG") == "1" {
+		opts = append(opts, bot.WithDebug())
+	}
+
+	b, err := bot.New(token, opts...)
 	if err != nil {
-		// Не удалось подключиться к Telegram — выходим с ошибкой
 		log.Fatalf("Ошибка создания бота: %v", err)
 	}
 
-	// Включаем режим отладки (выводит все запросы к Telegram в лог)
-	bot.Debug = true
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/help", bot.MatchTypeExact, helpCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/hello", bot.MatchTypeExact, helloCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/uptime", bot.MatchTypeExact, uptimeCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/myid", bot.MatchTypeExact, myidCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/stats", bot.MatchTypeExact, statsCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/status", bot.MatchTypeExact, statusCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/shutdown", bot.MatchTypeExact, shutdownCmd)
 
-	// Запоминаем время запуска для команды /uptime
 	startTime = time.Now()
+	log.Printf("Бот запущен (admin=%d)", adminChatID)
 
-	// Выводим в консоль информацию о запуске (логин бота)
-	log.Printf("Бот запущен: @%s", bot.Self.UserName)
-
-	// Шаг 3: Настраиваем получение обновлений (сообщений от пользователей)
-	// NewUpdate(0) — получать обновления с самого начала (или с последнего обработанного)
-	// Timeout = 60 секунд — максимальное время ожидания новых сообщений от Telegram
-	u := telegram.NewUpdate(0)
-	u.Timeout = 60
-
-	// Канал, куда Telegram будет присылать новые сообщения
-	updates := bot.GetUpdatesChan(u)
-
-	// Шаг 4: Бесконечный цикл обработки входящих сообщений
-	// for update := range updates — это аналог while(true), но работает на каналах Go
-	for update := range updates {
-		// update.Message может быть nil, если пришло не текстовое сообщение (например, редактирование)
-		if update.Message == nil {
-			continue // Пропускаем это обновление
-		}
-
-		// Получаем ID чата (куда отправлять ответ) и текст сообщения
-		chatID := update.Message.Chat.ID
-		text := strings.TrimSpace(update.Message.Text) // Убираем лишние пробелы
-
-		// Если сообщение пустое — пропускаем
-		if text == "" {
-			continue
-		}
-
-		// Проверяем, есть ли в сообщении ссылка на видео
-		if url := extractFirstURL(text); url != "" {
-			// Запускаем скачивание видео в фоновом режиме (go handleVideoURL)
-			// Это позволяет боту продолжать обрабатывать другие сообщения, пока качается видео
-			go handleVideoURL(bot, chatID, url)
-			continue // Переходим к следующему сообщению
-		}
-
-		// Если ссылок нет — обрабатываем как команду бота
-		msg := telegram.NewMessage(chatID, "") // Создаём новое сообщение для ответа
-
-		// Проверяем, какую команду отправил пользователь
-		switch text {
-		case "/start":
-			// Команда /start — приветствие и краткое описание возможностей
-			msg.Text = "Привет! Я умею скачивать видео. Отправь ссылку на YouTube, VK, Instagram, TikTok или другой сайт — пришлю видео.\n\n/help — справка\n/uptime — время работы бота"
-
-		case "/help":
-			// Команда /help — подробная справка по командам
-			msg.Text = "Доступные команды:\n/start — приветствие\n/help — эта справка\n/hello — поздороваться\n/uptime — время работы бота\n\nИли отправь ссылку на видео — скачаю и пришлю файл."
-
-		case "/uptime":
-			// Команда /uptime — показывает, сколько времени бот работает
-			msg.Text = formatUptime(time.Since(startTime))
-
-		case "/hello":
-			// Команда /hello — простое приветствие по имени пользователя
-			msg.Text = "Привет, " + update.Message.From.FirstName + "!"
-
-		default:
-			// Если команда не распознана — показываем подсказку
-			msg.Text = "Отправь ссылку на видео (YouTube, VK, Instagram, TikTok и др.) — я скачаю и пришлю файл. Или используй /help."
-		}
-
-		// Отправляем сообщение пользователю
-		if _, err := bot.Send(msg); err != nil {
-			// Если не удалось отправить — пишем в лог ошибку
-			log.Printf("Ошибка отправки: %v", err)
-		}
-	}
+	b.Start(ctx)
+	log.Println("Бот остановлен")
 }
 
-// ============================================================================
-// ФУНКЦИИ ДЛЯ ОБРАБОТКИ КОМАНД
-// ============================================================================
+func senderID(update *models.Update) int64 {
+	if update.Message != nil && update.Message.From != nil {
+		return update.Message.From.ID
+	}
+	return 0
+}
 
-// formatUptime преобразует время работы бота в читаемый вид
-// Принимает Duration (время в наносекундах), возвращает строку вида "1ч 30м 45с"
+func startCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   "Привет! Я умею скачивать видео. Отправь ссылку на YouTube, VK, Instagram, TikTok или другой сайт — пришлю видео.\n\n/help — справка\n/uptime — время работы бота",
+	})
+}
+
+func helpCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	text := "Доступные команды:\n/start — приветствие\n/help — эта справка\n/hello — поздороваться\n/uptime — время работы бота\n/myid — узнать свой Telegram ID\n\nИли отправь ссылку на видео — скачаю и пришлю файл."
+	if isAdmin(senderID(update)) {
+		text += "\n\nАдмин-команды:\n/stats — статистика скачиваний\n/status — текущее состояние\n/shutdown — остановить бота"
+	}
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   text,
+	})
+}
+
+func helloCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	name := "друг"
+	if update.Message.From != nil && update.Message.From.FirstName != "" {
+		name = update.Message.From.FirstName
+	}
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   "Привет, " + name + "!",
+	})
+}
+
+func uptimeCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   formatUptime(time.Since(startTime)),
+	})
+}
+
+func myidCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   fmt.Sprintf("Твой Telegram ID: %d", senderID(update)),
+	})
+}
+
+func statsCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if !isAdmin(senderID(update)) {
+		return
+	}
+	dl := atomic.LoadInt64(&statsDownloads)
+	errs := atomic.LoadInt64(&statsErrors)
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text: fmt.Sprintf("Статистика:\nСкачиваний: %d\nОшибок: %d\nУспешность: %d%%\nВремя работы: %s",
+			dl, errs, successRate(dl, errs), formatUptimeShort(time.Since(startTime))),
+	})
+}
+
+func statusCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if !isAdmin(senderID(update)) {
+		return
+	}
+	active := currentDownloads()
+	ytVer := ytDlpVersion()
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text: fmt.Sprintf("Состояние:\nАктивных скачиваний: %d/%d\nyt-dlp: %s\nUptime: %s",
+			active, maxConcurrentDownloads, ytVer, formatUptimeShort(time.Since(startTime))),
+	})
+}
+
+func shutdownCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if !isAdmin(senderID(update)) {
+		return
+	}
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   "Бот останавливается…",
+	})
+	log.Println("Запрошена остановка через /shutdown")
+	shutdownFunc()
+}
+
+func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if update.Message == nil {
+		return
+	}
+
+	text := strings.TrimSpace(update.Message.Text)
+	if text == "" {
+		return
+	}
+
+	if url := extractFirstURL(text); url != "" {
+		go handleVideoURL(ctx, b, update.Message.Chat.ID, url)
+		return
+	}
+
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   "Отправь ссылку на видео (YouTube, VK, Instagram, TikTok и др.) — я скачаю и пришлю файл. Или используй /help.",
+	})
+}
+
+func successRate(dl, errs int64) int64 {
+	if dl == 0 {
+		return 100
+	}
+	return (dl - errs) * 100 / dl
+}
+
+func ytDlpVersion() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, ytDlpBin(), "--version").Output()
+	if err != nil {
+		return "неизвестно"
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func formatUptime(d time.Duration) string {
-	// Округляем до секунд (убираем микросекунды)
 	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
 
-	// Вычисляем количество часов, минут и секунд
-	h := d / time.Hour   // Сколько целых часов
-	d -= h * time.Hour   // Вычитаем часы из общего времени
-	m := d / time.Minute // Сколько целых минут из оставшегося времени
-	d -= m * time.Minute // Вычитаем минуты
-	s := d / time.Second // Сколько целых секунд осталось
-
-	// Формируем строку в зависимости от того, сколько времени прошло
 	if h > 0 {
-		// Если есть часы: "1ч 30м 45с"
 		return fmt.Sprintf("Бот работает: %dч %dм %dс", h, m, s)
 	}
 	if m > 0 {
-		// Если есть минуты: "30м 45с"
 		return fmt.Sprintf("Бот работает: %dм %dс", m, s)
 	}
-	// Если только секунды: "45с"
 	return fmt.Sprintf("Бот работает: %dс", s)
 }
 
-// extractFirstURL ищет первую ссылку (URL) в тексте сообщения
-// Возвращает найденный URL или пустую строку, если ссылок нет
+func formatUptimeShort(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	if h > 0 {
+		return fmt.Sprintf("%dч %dм", h, m)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dм %dс", m, s)
+	}
+	return fmt.Sprintf("%dс", s)
+}
+
 func extractFirstURL(text string) string {
-	// Ищем URL с помощью регулярного выражения (urlRegex)
-	// FindString возвращает первое найденное совпадение
 	raw := urlRegex.FindString(text)
-
-	// Иногда в конце URL могут случайно оказаться знаки препинания
-	// (например, "Посмотри это видео: https://youtube.com/watch?v=abc!")
-	// Убираем их с помощью TrimRight
 	raw = strings.TrimRight(raw, ".,;:!?)")
-
 	return raw
 }
 
-// ============================================================================
-// ФУНКЦИИ ДЛЯ РАБОТЫ С ВИДЕО
-// ============================================================================
+func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
+	select {
+	case downloadSem <- struct{}{}:
+	default:
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "Слишком много одновременных скачиваний, попробуй позже.",
+		})
+		return
+	}
+	defer func() { <-downloadSem }()
 
-// handleVideoURL обрабатывает ссылку на видео: скачивает и отправляет пользователю
-// Запускается в отдельной горутине (go handleVideoURL), чтобы не блокировать бота
-//
-// Параметры:
-//   - bot: объект бота для отправки сообщений
-//   - chatID: ID чата пользователя (куда отправлять ответ)
-//   - url: ссылка на видео, которую нужно скачать
-func handleVideoURL(bot *telegram.BotAPI, chatID int64, url string) {
-	// Сбрасываем длительность предыдущего видео
-	videoDuration = 0
+	statusMsg, _ := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text:   "Скачиваю видео…",
+	})
 
-	// Засекаем время начала скачивания
-	startTime := time.Now()
+	dlStart := time.Now()
+	result, err := downloadVideo(url)
+	downloadDuration := time.Since(dlStart)
 
-	// Шаг 1: Отправляем "статусное" сообщение, чтобы пользователь знал, что идёт скачивание
-	statusMsg, _ := bot.Send(telegram.NewMessage(chatID, "Скачиваю видео…"))
+	atomic.AddInt64(&statsDownloads, 1)
 
-	// Шаг 2: Скачиваем видео с помощью yt-dlp
-	// Функция возвращает путь к скачанному файлу или ошибку
-	filePath, err := downloadVideo(url)
-
-	// Вычисляем время, затраченное на скачивание
-	downloadDuration := time.Since(startTime)
-
-	// Шаг 3: Если при скачивании произошла ошибка
 	if err != nil {
+		atomic.AddInt64(&statsErrors, 1)
 		log.Printf("Ошибка скачивания %s: %v", url, err)
-
-		// Отправляем пользователю сообщение об ошибке
-		errMsg := "Не удалось скачать видео: " + err.Error() + "\n\nПроверь ссылку и доступность ролика (приватное, регион и т.д.)."
-		bot.Send(telegram.NewMessage(chatID, errMsg))
-
-		// Удаляем сообщение "Скачиваю видео…"
-		bot.Request(telegram.NewDeleteMessage(chatID, statusMsg.MessageID))
-		return // Выходим из функции
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "Не удалось скачать видео. Проверь ссылку и доступность ролика (приватное, регион и т.д.).",
+		})
+		if statusMsg != nil {
+			b.DeleteMessage(ctx, &bot.DeleteMessageParams{
+				ChatID:    chatID,
+				MessageID: statusMsg.ID,
+			})
+		}
+		return
 	}
 
-	// defer гарантирует, что временная папка с видео удалится после завершения функции
-	// Даже если произойдёт ошибка при отправке, папка всё равно очистится
-	defer os.RemoveAll(filepath.Dir(filePath))
+	defer os.RemoveAll(filepath.Dir(result.filePath))
 
-	// Шаг 4: Удаляем сообщение "Скачиваю видео…"
-	bot.Request(telegram.NewDeleteMessage(chatID, statusMsg.MessageID))
+	if statusMsg != nil {
+		b.DeleteMessage(ctx, &bot.DeleteMessageParams{
+			ChatID:    chatID,
+			MessageID: statusMsg.ID,
+		})
+	}
 
-	// Шаг 5: Проверяем размер файла
-	// Telegram не позволяет отправлять файлы больше 50 МБ
-	info, err := os.Stat(filePath) // Получаем информацию о файле (размер, дата и т.д.)
+	info, err := os.Stat(result.filePath)
 	if err != nil {
 		log.Printf("Ошибка получения информации о файле: %v", err)
-		bot.Send(telegram.NewMessage(chatID, "Не удалось получить информацию о файле."))
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "Не удалось получить информацию о файле.",
+		})
 		return
 	}
 
-	if info.Size() > maxFileSizeMB*1024*1024 { // 50 МБ в байтах
-		// Файл слишком большой — сообщаем пользователю
-		bot.Send(telegram.NewMessage(chatID, "Файл получился больше 50 МБ — Telegram не примет такой размер. Попробуй другую ссылку или качество."))
+	if info.Size() > maxFileSizeMB*1024*1024 {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "Файл получился больше 50 МБ — Telegram не примет такой размер. Попробуй другую ссылку или качество.",
+		})
 		return
 	}
 
-	// Шаг 6: Получаем длительность видео
-	// Мы уже получили её при скачивании через yt-dlp (из JSON-метаданных)
-	duration := videoDuration
-
-	// Если по какой-то причине длительность не получена — пробуем через ffprobe
+	duration := result.duration
 	if duration == 0 {
-		duration = getVideoDuration(filePath)
+		duration = getVideoDuration(result.filePath)
 	}
 
-	// Формируем подпись для файла
-	filename := filepath.Base(filePath)
+	filename := filepath.Base(result.filePath)
 	sizeStr := formatFileSize(info.Size())
 	durationStr := formatDuration(duration)
 	downloadTimeStr := formatDuration(downloadDuration)
 
 	caption := fmt.Sprintf("📹 %s\n⏱ Длительность: %s\n💾 Размер: %s\n⚡ Обработано за: %s",
 		filename, durationStr, sizeStr, downloadTimeStr)
+	if len(caption) > maxCaptionLen {
+		caption = caption[:maxCaptionLen]
+	}
 
-	// Шаг 7: Пытаемся отправить видео с подписью
-	// Сначала пробуем как видео (Telegram понимает, что это видео, и показывает плеер)
-	video := telegram.NewVideo(chatID, telegram.FilePath(filePath))
-	video.Caption = caption // Добавляем подпись
-	if _, err := bot.Send(video); err != nil {
-		// Если не получилось отправить как видео (например, необычный формат),
-		// пробуем отправить как документ (файл)
-		doc := telegram.NewDocument(chatID, telegram.FilePath(filePath))
-		doc.Caption = caption // Добавляем подпись
-		if _, err2 := bot.Send(doc); err2 != nil {
-			// Если и как документ не получилось — сообщаем об ошибке
-			log.Printf("Ошибка отправки файла: %v", err)
-			bot.Send(telegram.NewMessage(chatID, "Скачал файл, но не получилось отправить: "+err.Error()))
+	fileContent, err := os.ReadFile(result.filePath)
+	if err != nil {
+		log.Printf("Ошибка чтения файла: %v", err)
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "Не удалось прочитать скачанный файл.",
+		})
+		return
+	}
+
+	_, sendErr := b.SendVideo(ctx, &bot.SendVideoParams{
+		ChatID:  chatID,
+		Video:   &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(fileContent)},
+		Caption: caption,
+	})
+
+	if sendErr != nil {
+		log.Printf("Отправка как видео не удалась: %v, пробую как документ", sendErr)
+		_, docErr := b.SendDocument(ctx, &bot.SendDocumentParams{
+			ChatID:   chatID,
+			Document: &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(fileContent)},
+			Caption:  caption,
+		})
+		if docErr != nil {
+			log.Printf("Ошибка отправки файла: %v", docErr)
+			b.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Скачал файл, но не получилось отправить.",
+			})
 		}
 	}
-	// Если отправка успешна — всё готово, функция завершится,
-	// и defer удалит временную папку с видео
 }
 
-// formatFileSize преобразует размер файла в читаемый вид
-// Например:
-//   - 500 байт -> "500 B"
-//   - 1024 байт -> "1.0 KB"
-//   - 1536 байт -> "1.5 KB"
-//   - 1048576 байт -> "1.0 MB"
 func formatFileSize(bytes int64) string {
-	// Единица измерения — 1024 (二进制, потому что компьютеры используют двоичную систему)
-	// 1 KB = 1024 байт, 1 MB = 1024 KB, и так далее
 	const unit = 1024
-
-	// Если файл меньше 1 KB — просто показываем количество байт
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
 	}
 
-	// Начинаем с делителя = 1024 (для KB)
 	div := int64(unit)
 	exp := 0
-
-	// Определяем нужную единицу измерения:
-	// Если bytes >= 1024 * 1024 (1 MB), увеличиваем делитель и счётчик
-	// Повторяем, пока не дойдём до TB или пока число станет меньше следующего порога
-	for bytes >= div*unit && exp < 3 { // максимально до TB (терабайт)
-		div *= unit // 1024 -> 1048576 -> 1073741824
-		exp++       // 0 (KB) -> 1 (MB) -> 2 (GB) -> 3 (TB)
+	for bytes >= div*unit && exp < 3 {
+		div *= unit
+		exp++
 	}
 
-	// Вычисляем целую часть (сколько целых единиц помещается)
-	// Например: 1572864 / 1048576 = 1 (1 MB)
 	whole := bytes / div
-
-	// Вычисляем первую цифру после запятой
-	// Например: (1572864 % 1048576) * 10 / 1048576 = 524288 * 10 / 1048576 = 5
-	// Результат: "1.5 MB"
 	frac := (bytes % div) * 10 / div
-
-	// Названия единиц измерения по порядку
 	units := []string{"KB", "MB", "GB", "TB"}
 
-	// Формируем строку ответа
-	// Если есть дробная часть — показываем её, иначе — только целую
 	if frac > 0 {
 		return fmt.Sprintf("%d.%d %s", whole, frac, units[exp])
 	}
 	return fmt.Sprintf("%d %s", whole, units[exp])
 }
 
-// formatDuration преобразует длительность в читаемый вид
-// Например: 125 секунд -> "2:05", 3725 секунд -> "1:02:05"
 func formatDuration(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := d / time.Hour
@@ -420,79 +456,43 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", m, s)
 }
 
-// getVideoDuration получает длительность видео с помощью ffprobe
-// ffprobe — это утилита, входящая в состав ffmpeg, которая читает метаданные видеофайлов
-//
-// Параметры:
-//   - filePath: путь к видеофайлу
-//
-// Возвращает:
-//   - длительность видео в формате time.Duration (например, 2m30s)
-//   - или 0, если не удалось получить длительность
 func getVideoDuration(filePath string) time.Duration {
-	// Создаём команду ffprobe с параметрами:
-	//   -v error        — выводить только ошибки, без предупреждений (чистый вывод)
-	//   -show_entries format=duration — показать только поле "duration" (длительность)
-	//   -of default=noprint_wrappers=1:nokey=1 — вывести только само число без лишнего форматирования
-	//
-	// Пример вывода ffprobe: "125.5" (длительность в секундах)
-	cmd := exec.Command("ffprobe",
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",
 		filePath,
 	)
-
-	// Запускаем команду и получаем её вывод (Output() возвращает stdout)
 	output, err := cmd.Output()
-
-	// Если произошла ошибка при запуске ffprobe
-	// (например, файл повреждён или ffprobe не установлен)
 	if err != nil {
 		log.Printf("Ошибка получения длительности: %v", err)
-		return 0 // Возвращаем 0, чтобы не ломать дальнейшую логику
+		return 0
 	}
 
-	// Вывод ffprobe — это строка с числом, например: "125.5" или "3723.123"
-	// Нужно преобразовать эту строку в число (float64)
 	var seconds float64
-
-	// fmt.Sscanf аналогичен scanf в C: читает значение из строки по формату "%f" (float)
-	// Результат записывается в переменную seconds
 	if _, err := fmt.Sscanf(string(output), "%f", &seconds); err != nil {
 		log.Printf("Ошибка парсинга длительности: %v", err)
 		return 0
 	}
 
-	// Преобразуем секунды в Duration
-	// time.Duration хранит время в наносекундах, поэтому умножаем на количество наносекунд в секунде
-	// Пример: 125.5 секунд = 125.5 * 1_000_000_000 наносекунд
 	return time.Duration(seconds * float64(time.Second))
 }
 
-// downloadVideo скачивает видео по URL с помощью yt-dlp
-// Возвращает путь к скачанному файлу или ошибку, если не удалось скачать
-func downloadVideo(url string) (string, error) {
-	// Шаг 1: Определяем, какой исполняемый файл использовать для yt-dlp
-	// Можно указать свой путь через переменную окружения YT_DLP_BIN
-	// Если не указана — используем стандартную команду "yt-dlp"
-	ytDlp := os.Getenv("YT_DLP_BIN")
-	if ytDlp == "" {
-		ytDlp = "yt-dlp"
-	}
+func downloadVideo(url string) (*downloadResult, error) {
+	ytDlp := ytDlpBin()
 
-	// Шаг 2: Создаём временную папку для скачивания
-	// MkdirTemp создаёт папку с случайным именем в системной временной директории
-	// Шаблон "tg-video-*" означает, что имя будет начинаться с "tg-video-"
 	dir, err := os.MkdirTemp("", "tg-video-*")
 	if err != nil {
-		return "", err // Возвращаем пустую строку и ошибку
+		return nil, err
 	}
 
-	// Шаг 3: Сначала получаем метаданные видео (заголовок, длительность)
-	// Используем --dump-json для получения информации в JSON-формате
-	// Это позволяет узнать название видео перед скачиванием
-	cmdInfo := exec.Command(ytDlp,
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	defer cancel()
+
+	cmdInfo := exec.CommandContext(ctx, ytDlp,
 		"--no-playlist",
 		"--dump-json",
 		"--no-warnings",
@@ -502,48 +502,30 @@ func downloadVideo(url string) (string, error) {
 	infoOutput, err := cmdInfo.Output()
 	if err != nil {
 		os.RemoveAll(dir)
-		return "", fmt.Errorf("не удалось получить информацию о видео: %v", err)
+		return nil, fmt.Errorf("не удалось получить информацию о видео: %v", err)
 	}
 
-	// Парсим JSON-ответ
-	// Ищем поля "title" и "duration" в JSON
-	jsonStr := string(infoOutput)
-	title := extractJSONString(jsonStr, "title")
-	duration := extractJSONFloat(jsonStr, "duration")
+	var vi videoInfo
+	if err := json.Unmarshal(infoOutput, &vi); err != nil {
+		log.Printf("Ошибка парсинга JSON от yt-dlp: %v", err)
+		vi.Title = ""
+		vi.Duration = 0
+	}
 
-	// Если не удалось получить title — используем случайное имя
+	title := vi.Title
 	if title == "" {
 		title = "video"
 	}
-
-	// Очищаем название от недопустимых символов для имени файла
-	// Оставляем только буквы, цифры, дефисы, подчёркивания и пробелы
 	title = sanitizeFilename(title)
 
-	// Сохраняем длительность в глобальную переменную для использования при отправке
-	// Это нужно, так как функция возвращает только путь к файлу
-	if duration > 0 {
-		videoDuration = time.Duration(duration * float64(time.Second))
+	var duration time.Duration
+	if vi.Duration > 0 {
+		duration = time.Duration(vi.Duration * float64(time.Second))
 	}
 
-	// Формируем путь для сохранения файла с использованием названия видео
-	// %(title).100s — обрезаем название до 100 символов, чтобы не было слишком длинных имён
-	// %(ext)s — расширение файла
 	outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
 
-	// Шаг 4: Формируем команду для yt-dlp с нужными параметрами
-	//
-	// Параметры yt-dlp:
-	//   --no-playlist        Не скачивать весь плейлист, только одно видео
-	//   -f best[ext=mp4]/best   Формат: сначала пробуем лучший mp4, иначе — лучший доступный
-	//   --merge-output-format mp4  Если видео и аудио отдельно — объединяем в MP4
-	//   --max-filesize 50M    Не скачивать файлы больше 50 МБ
-	//   -o outPath           Куда сохранять файл (с плейсхолдером для расширения)
-	//   --no-warnings        Не выводить предупреждения в консоль
-	//   --no-call-home       Не отправлять статистику разработчикам yt-dlp
-	//   --user-agent         Эмулируем браузер Firefox, чтобы сайты не блокировали бота
-	//   url                  Ссылка на видео
-	cmd := exec.Command(ytDlp,
+	cmd := exec.CommandContext(ctx, ytDlp,
 		"--no-playlist",
 		"-f", "best[ext=mp4]/best",
 		"--merge-output-format", "mp4",
@@ -554,185 +536,44 @@ func downloadVideo(url string) (string, error) {
 		"--user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:131.0) Gecko/20100101 Firefox/131.0",
 		url,
 	)
-
-	// Устанавливаем рабочую директорию для команды
 	cmd.Dir = dir
 
-	// Шаг 5: Запускаем команду и ждём результат
-	// CombinedOutput возвращает stdout + stderr (всё, что команда вывела в консоль)
 	out, err := cmd.CombinedOutput()
-
-	// Шаг 6: Обрабатываем ошибку скачивания
 	if err != nil {
-		// Удаляем временную папку, так как она больше не нужна
 		os.RemoveAll(dir)
-
-		// Преобразуем вывод команды в строку и убираем лишние пробелы
 		raw := strings.TrimSpace(string(out))
-
-		// Полный вывод записываем в лог (для отладки)
 		log.Printf("[yt-dlp] URL=%s err=%v\n[yt-dlp] полный вывод:\n%s", url, err, raw)
-
-		// Формируем сообщение для пользователя
-		// Ограничиваем длину, чтобы оно поместилось в Telegram
-		msg := raw
-		if len(msg) > maxErrorMsgLen {
-			// Если слишком длинное — берём последние символы (там обычно самая важная информация)
-			msg = "...\n" + msg[len(msg)-maxErrorMsgLen:]
-		}
-
-		// Возвращаем ошибку с информацией для пользователя
-		if msg != "" {
-			return "", fmt.Errorf("%v\n\nЛог yt-dlp:\n%s", err, msg)
-		}
-		return "", err
+		return nil, fmt.Errorf("ошибка скачивания")
 	}
 
-	// Шаг 7: Ищем скачанный файл
-	// yt-dlp создаёт файл с реальным названием и расширением
-	entries, _ := os.ReadDir(dir) // Читаем содержимое временной папки
-
-	// Проходим по всем файлам в папке
+	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
-		if !e.IsDir() { // Если это файл, а не папка
-			// Возвращаем полный путь к файлу
-			return filepath.Join(dir, e.Name()), nil
+		if !e.IsDir() {
+			return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration}, nil
 		}
 	}
 
-	// Если файлов не нашлось (странная ситуация) — возвращаем ошибку
 	os.RemoveAll(dir)
-	return "", os.ErrNotExist
+	return nil, os.ErrNotExist
 }
 
-// sanitizeFilename очищает строку от недопустимых символов в имени файла
-// Оставляет только безопасные символы: буквы, цифры, пробелы, дефисы, подчёркивания
-//
-// Зачем это нужно:
-//   - На разных операционных системах (Windows, Linux, macOS) разные ограничения на имена файлов
-//   - Некоторые символы (/:\*?"<>|) зарезервированы и не могут использоваться
-//   - Смайлики и специальные символы могут вызвать проблемы
-//
-// Примеры:
-//   - "Как собрать ПК? 😎" -> "Как собрать ПК " (удалены ? и эмодзи)
-//   - "video:2024/test" -> "video2024test" (удалены : и /)
-//   - "  hello world  " -> "hello world" (обрезаны пробелы по краям)
 func sanitizeFilename(name string) string {
-	// Функция-предикат: проверяет, является ли символ допустимым
-	// Возвращает true, если символ можно оставить
-	allowed := func(r rune) bool {
-		// Латинские буквы (a-z, A-Z)
-		isLatin := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
-
-		// Русские буквы (а-я, А-Я)
-		isCyrillic := (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я')
-
-		// Цифры (0-9)
-		isDigit := r >= '0' && r <= '9'
-
-		// Специальные символы, которые разрешены в именах файлов
-		isAllowedSpecial := r == ' ' || r == '-' || r == '_' || r == '.'
-
-		// Разрешаем символ, если он подходит под любое условие
-		return isLatin || isCyrillic || isDigit || isAllowedSpecial
-	}
-
-	// strings.Map применяет функцию к каждому символу строки:
-	//   - Если функция возвращает символ — он остаётся в результате
-	//   - Если функция возвращает -1 — символ удаляется
 	result := strings.Map(func(r rune) rune {
-		if allowed(r) {
-			return r // Оставляем символ
+		if isFilenameSafe(r) {
+			return r
 		}
-		return -1 // Удаляем символ
+		return -1
 	}, name)
-
-	// strings.TrimSpace убирает пробелы в начале и конце строки
 	result = strings.TrimSpace(result)
-
-	// Если все символы были удалены — возвращаем "video" по умолчанию
 	if result == "" {
 		return "video"
 	}
-
 	return result
 }
 
-// extractJSONString ищет значение строкового поля в JSON-выводе yt-dlp
-// Использует регулярные выражения для простого парсинга JSON без внешних библиотек
-//
-// Параметры:
-//   - json: строка с JSON-данными (например, '{"title": "My Video", "duration": 120}')
-//   - field: имя поля, значение которого нужно получить (например, "title")
-//
-// Возвращает:
-//   - значение поля (например, "My Video")
-//   - или пустую строку, если поле не найдено
-//
-// Пример работы:
-//
-//	Вход:  json = '{"title": "Как собрать ПК", "duration": 125.5}'
-//	field = "title"
-//	Выход: "Как собрать ПК"
-func extractJSONString(json, field string) string {
-	// Создаём регулярное выражение (шаблон) для поиска
-	//   "%s":\s*"([^"]*)" — ищет что-то вроде "title": "значение"
-	//   - %s подставляет имя поля (title)
-	//   - :\s* означает двоеточие и любые пробелы после него
-	//   - "([^"]*)" — захватывает всё внутри кавычек (кроме самих кавычек)
-	//
-	// Пример для поля "title":
-	//   Шаблон: "title":\s*"([^"]*)"
-	//   Вход:    {"title": "My Video", ...}
-	//   Найдёт:  "title": "My Video"
-	//   groups:  [полное совпадение, "My Video"] — нам нужно второе (индекс 1)
-	pattern := fmt.Sprintf(`"%s":\s*"([^"]*)"`, field)
-
-	// Компилируем регулярное выражение в объект для повторного использования
-	re := regexp.MustCompile(pattern)
-
-	// Ищем первое совпадение в JSON-строке
-	// FindStringSubmatch возвращает массив:
-	//   [0] — полное совпадение (вся строка "title": "value")
-	//   [1] — первая группа в скобках ( значение )
-	matches := re.FindStringSubmatch(json)
-
-	// Если нашли совпадение и в нём есть хотя бы одна группа — возвращаем её
-	if len(matches) > 1 {
-		return matches[1]
-	}
-
-	// Поле не найдено — возвращаем пустую строку
-	return ""
-}
-
-// extractJSONFloat ищет значение числового поля (например, duration) в JSON-выводе yt-dlp
-//
-// Параметры:
-//   - json: строка с JSON-данными
-//   - field: имя числового поля (например, "duration")
-//
-// Возвращает:
-//   - значение числа (например, 125.5)
-//   - или 0, если поле не найдено
-func extractJSONFloat(json, field string) float64 {
-	// Регулярное выражение для поиска числа:
-	//   "%s":\s*([0-9.]+)
-	//   - %s подставляет имя поля
-	//   - :\s* — двоеточие и пробелы
-	//   - ([0-9.]+) — захватывает цифры и точку (например, 125.5)
-	pattern := fmt.Sprintf(`"%s":\s*([0-9.]+)`, field)
-
-	re := regexp.MustCompile(pattern)
-	matches := re.FindStringSubmatch(json)
-
-	if len(matches) > 1 {
-		// Преобразуем найденную строку в число (float64)
-		// fmt.Sscanf аналогичен printf, но работает в обратную сторону — читает из строки
-		var val float64
-		fmt.Sscanf(matches[1], "%f", &val)
-		return val
-	}
-
-	return 0
+func isFilenameSafe(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+		(r >= '0' && r <= '9') ||
+		r == ' ' || r == '-' || r == '_' || r == '.' ||
+		(unicode.IsLetter(r) && unicode.IsPrint(r))
 }

@@ -19,3 +19,7 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+opencode.json
+CLAUDE.md
+AGENTS.md
