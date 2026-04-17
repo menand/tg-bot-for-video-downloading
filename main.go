@@ -31,6 +31,7 @@ const (
 	downloadTimeout        = 10 * time.Minute
 	maxConcurrentDownloads = 3
 	maxLogSize             = 5 * 1024 * 1024
+	settingsPath           = "/data/bot-settings.json"
 )
 
 var (
@@ -38,11 +39,31 @@ var (
 	startTime    time.Time
 	adminChatID  int64
 	shutdownFunc context.CancelFunc
-	logPath      = "/tmp/bot.log"
+	botInstance  *bot.Bot
+	logPath      = "/data/bot.log"
 
 	statsDownloads int64
 	statsErrors    int64
 )
+
+type botSettings struct {
+	StartupNotify bool `json:"startup_notify"`
+}
+
+var settings = botSettings{StartupNotify: true}
+
+func loadSettings() {
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &settings)
+}
+
+func saveSettings() {
+	data, _ := json.Marshal(settings)
+	os.WriteFile(settingsPath, data, 0644)
+}
 
 type downloadResult struct {
 	filePath string
@@ -188,17 +209,29 @@ func main() {
 		log.Fatalf("Ошибка создания бота: %v", err)
 	}
 
+	botInstance = b
+
+	loadSettings()
+
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/help", bot.MatchTypeExact, helpCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/myid", bot.MatchTypeExact, myidCmd)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/uptime", bot.MatchTypeExact, uptimeCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/stats", bot.MatchTypeExact, statsCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/status", bot.MatchTypeExact, statusCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/shutdown", bot.MatchTypeExact, shutdownCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/log", bot.MatchTypeExact, logCmd)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/notify", bot.MatchTypeExact, notifyCmd)
 
 	startTime = time.Now()
-	log.Printf("Бот запущен (admin=%d, yt-dlp=%s)", adminChatID, ytDlpVersion())
+	ytVer := ytDlpVersion()
+	log.Printf("Бот запущен (admin=%d, yt-dlp=%s)", adminChatID, ytVer)
+
+	if adminChatID != 0 && settings.StartupNotify {
+		b.SendMessage(context.Background(), &bot.SendMessageParams{
+			ChatID: adminChatID,
+			Text:   fmt.Sprintf("Бот запущен\nyt-dlp: %s", ytVer),
+		})
+	}
 
 	b.Start(ctx)
 	log.Println("Бот остановлен")
@@ -243,21 +276,11 @@ func startCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 func helpCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 	text := "Доступные команды:\n/help — справка\n/myid — узнать свой Telegram ID\n/start — приветствие\n\nИли отправь ссылку на видео — скачаю и пришлю файл."
 	if isAdmin(senderID(update)) {
-		text += "\n\nАдмин-команды:\n/log — получить лог-файл\n/shutdown — остановить бота\n/stats — статистика скачиваний\n/status — текущее состояние\n/uptime — время работы бота"
+		text += "\n\nАдмин-команды:\n/log — получить лог-файл\n/notify — вкл/выкл уведомление о запуске\n/shutdown — остановить бота\n/stats — статистика скачиваний\n/status — текущее состояние"
 	}
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   text,
-	})
-}
-
-func uptimeCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
-	if !isAdmin(senderID(update)) {
-		return
-	}
-	b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   formatUptime(time.Since(startTime)),
 	})
 }
 
@@ -343,6 +366,24 @@ func logCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 			Text:   fmt.Sprintf("Не удалось отправить лог-файл: %v", err),
 		})
 	}
+}
+
+func notifyCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if !isAdmin(senderID(update)) {
+		return
+	}
+	settings.StartupNotify = !settings.StartupNotify
+	saveSettings()
+
+	state := "выключено"
+	if settings.StartupNotify {
+		state = "включено"
+	}
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   fmt.Sprintf("Уведомление о запуске бота: %s", state),
+	})
+	log.Printf("[cmd] /notify: уведомление о запуске %s", state)
 }
 
 func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -665,10 +706,10 @@ func downloadVideo(url string) (*downloadResult, error) {
 	}
 
 	formats := []string{
+		"best[ext=mp4]/best",
 		"best[ext=mp4][height<=720]/best[height<=720]",
 		"best[ext=mp4][height<=480]/best[height<=480]",
 		"best[ext=mp4][height<=360]/best[height<=360]",
-		"best[ext=mp4]/best",
 	}
 
 	var lastErr error
