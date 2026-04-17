@@ -211,19 +211,29 @@ func senderID(update *models.Update) int64 {
 	return 0
 }
 
-func senderName(update *models.Update) string {
-	if update.Message != nil && update.Message.From != nil {
-		name := update.Message.From.FirstName
-		if update.Message.From.LastName != "" {
-			name += " " + update.Message.From.LastName
-		}
-		return name
+func senderInfo(update *models.Update) string {
+	if update.Message == nil || update.Message.From == nil {
+		return "Пользователь: неизвестен"
 	}
-	return "unknown"
+	u := update.Message.From
+	name := u.FirstName
+	if u.LastName != "" {
+		name += " " + u.LastName
+	}
+	nick := ""
+	if u.Username != "" {
+		nick = "@" + u.Username
+	}
+	return fmt.Sprintf("Пользователь: Имя - %s, id - %d%s", name, u.ID, func() string {
+		if nick != "" {
+			return ", nick - " + nick
+		}
+		return ""
+	}())
 }
 
 func startCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
-	log.Printf("[cmd] /start от %s (id=%d)", senderName(update), senderID(update))
+	log.Printf("[cmd] /start от %s (id=%d)", senderInfo(update), senderID(update))
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   "Привет! Я умею скачивать видео. Отправь ссылку на YouTube, VK, Instagram, TikTok или другой сайт — пришлю видео.\n\n/help — справка",
@@ -252,7 +262,7 @@ func uptimeCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 }
 
 func myidCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
-	log.Printf("[cmd] /myid от %s (id=%d)", senderName(update), senderID(update))
+	log.Printf("[cmd] /myid от %s (id=%d)", senderInfo(update), senderID(update))
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   fmt.Sprintf("Твой Telegram ID: %d", senderID(update)),
@@ -346,12 +356,13 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 
 	if url := extractFirstURL(text); url != "" {
-		log.Printf("[url] %s запросил скачивание: %s", senderName(update), url)
+		log.Printf("—————————")
+		log.Printf("[url] %s запросил скачивание: %s", senderInfo(update), url)
 		go handleVideoURL(ctx, b, update.Message.Chat.ID, url)
 		return
 	}
 
-	log.Printf("[msg] от %s (id=%d): %q", senderName(update), senderID(update), text)
+	log.Printf("[msg] от %s (id=%d): %q", senderInfo(update), senderID(update), text)
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   "Отправь ссылку на видео (YouTube, VK, Instagram, TikTok и др.) — я скачаю и пришлю файл. Или используй /help.",
@@ -624,7 +635,6 @@ func downloadVideo(url string) (*downloadResult, error) {
 		"--no-playlist",
 		"--dump-json",
 		"--no-warnings",
-		"--no-call-home",
 		url,
 	)
 	infoOutput, err := cmdInfo.Output()
@@ -655,8 +665,7 @@ func downloadVideo(url string) (*downloadResult, error) {
 	}
 
 	formats := []string{
-		"best[ext=mp4][filesize<50M]/best[filesize<50M]",
-		"best[ext=mp4][height<=720][filesize<50M]/best[height<=720][filesize<50M]",
+		"best[ext=mp4][height<=720]/best[height<=720]",
 		"best[ext=mp4][height<=480]/best[height<=480]",
 		"best[ext=mp4][height<=360]/best[height<=360]",
 		"best[ext=mp4]/best",
@@ -677,7 +686,6 @@ func downloadVideo(url string) (*downloadResult, error) {
 			"--max-filesize", "50M",
 			"-o", outPath,
 			"--no-warnings",
-			"--no-call-home",
 			"--user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:131.0) Gecko/20100101 Firefox/131.0",
 			url,
 		)
@@ -693,12 +701,18 @@ func downloadVideo(url string) (*downloadResult, error) {
 
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
-			if !e.IsDir() {
-				fi, _ := e.Info()
-				log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
-					i+1, url, format, e.Name(), formatFileSize(fi.Size()))
-				return &downloadResult{filePath: filepath.Join(dir, e.Name()), duration: duration, width: vi.Width, height: vi.Height}, nil
+			if e.IsDir() {
+				continue
 			}
+			name := e.Name()
+			if strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".ytdl") {
+				log.Printf("[yt-dlp] пропуск temp-файла: %s", name)
+				continue
+			}
+			fi, _ := e.Info()
+			log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
+				i+1, url, format, name, formatFileSize(fi.Size()))
+			return &downloadResult{filePath: filepath.Join(dir, name), duration: duration, width: vi.Width, height: vi.Height}, nil
 		}
 
 		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
