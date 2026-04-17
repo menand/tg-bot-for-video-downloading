@@ -22,7 +22,9 @@ RUN arch="$(uname -m)" && \
     chmod +x /usr/local/bin/yt-dlp && \
     yt-dlp --version
 
-RUN adduser -D -g '' botuser
+RUN adduser -D -g '' botuser && \
+    mkdir -p /data && \
+    chown botuser /data
 
 COPY --from=builder /telegram-bot /telegram-bot
 USER botuser
