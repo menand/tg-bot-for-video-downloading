@@ -551,15 +551,107 @@ func extractFirstURL(text string) string {
 	return raw
 }
 
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"connection reset",
+		"connection refused",
+		"i/o timeout",
+		"no such host",
+		"tls handshake",
+		"temporarily unavailable",
+		"eof",
+		"timeout",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func retryOnTransient(ctx context.Context, attempts int, fn func() error) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isTransientErr(err) {
+			return err
+		}
+		log.Printf("[retry] %d/%d после транзиентной ошибки: %v", i+1, attempts, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(i+1) * time.Second):
+		}
+	}
+	return lastErr
+}
+
+func sendTextWithRetry(ctx context.Context, b *bot.Bot, chatID int64, text string) {
+	err := retryOnTransient(ctx, 3, func() error {
+		_, e := b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   text,
+		})
+		return e
+	})
+	if err != nil {
+		log.Printf("[send] SendMessage не ушло (chatID=%d): %v", chatID, err)
+	}
+}
+
+func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, filePath, filename, caption string) error {
+	asVideo := func() error {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = b.SendVideo(ctx, &bot.SendVideoParams{
+			ChatID:  chatID,
+			Video:   &models.InputFileUpload{Filename: filename, Data: f},
+			Caption: caption,
+		})
+		return err
+	}
+	asDocument := func() error {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = b.SendDocument(ctx, &bot.SendDocumentParams{
+			ChatID:   chatID,
+			Document: &models.InputFileUpload{Filename: filename, Data: f},
+			Caption:  caption,
+		})
+		return err
+	}
+
+	if err := retryOnTransient(ctx, 2, asVideo); err == nil {
+		return nil
+	} else {
+		log.Printf("[send] видео не ушло: %v, пробую документом", err)
+	}
+	return retryOnTransient(ctx, 2, asDocument)
+}
+
 func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	defer downloadWG.Done()
 
 	if !acquireChatSlot(chatID) {
 		log.Printf("[download] отклонён: per-chat limit (chatID=%d, url=%s)", chatID, url)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "У тебя уже идёт скачивание, дождись его завершения.",
-		})
+		sendTextWithRetry(ctx, b, chatID, "У тебя уже идёт скачивание, дождись его завершения.")
 		return
 	}
 	defer releaseChatSlot(chatID)
@@ -568,10 +660,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	case downloadSem <- struct{}{}:
 	default:
 		log.Printf("[download] отклонён: semaphore полон (url=%s)", url)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Слишком много одновременных скачиваний, попробуй позже.",
-		})
+		sendTextWithRetry(ctx, b, chatID, "Слишком много одновременных скачиваний, попробуй позже.")
 		return
 	}
 	defer func() { <-downloadSem }()
@@ -583,8 +672,33 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		Text:   "Скачиваю видео…",
 	})
 
+	var progressMu sync.Mutex
+	var lastProgressText string
+	var lastProgressAt time.Time
+	var onProgress progressFunc
+	if statusMsg != nil {
+		onProgress = func(percent, downloaded, total, speed string) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			if time.Since(lastProgressAt) < 2*time.Second {
+				return
+			}
+			text := fmt.Sprintf("Скачиваю: %s  %s/%s  %s", percent, downloaded, total, speed)
+			if text == lastProgressText {
+				return
+			}
+			lastProgressAt = time.Now()
+			lastProgressText = text
+			b.EditMessageText(ctx, &bot.EditMessageTextParams{
+				ChatID:    chatID,
+				MessageID: statusMsg.ID,
+				Text:      text,
+			})
+		}
+	}
+
 	dlStart := time.Now()
-	result, err := downloadVideo(ctx, url)
+	result, err := downloadVideo(ctx, url, onProgress)
 	downloadDuration := time.Since(dlStart)
 
 	atomic.AddInt64(&statsAttempts, 1)
@@ -602,10 +716,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 			userMsg = "Не удалось скачать: " + ytErr.msg
 		}
 
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   userMsg,
-		})
+		sendTextWithRetry(ctx, b, chatID, userMsg)
 		if statusMsg != nil {
 			b.DeleteMessage(ctx, &bot.DeleteMessageParams{
 				ChatID:    chatID,
@@ -627,10 +738,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	info, err := os.Stat(result.filePath)
 	if err != nil {
 		log.Printf("[download] ошибка stat: url=%s err=%v", url, err)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Не удалось получить информацию о файле.",
-		})
+		sendTextWithRetry(ctx, b, chatID, "Не удалось получить информацию о файле.")
 		return
 	}
 
@@ -640,10 +748,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	if info.Size() > maxFileSizeMB*1024*1024 {
 		log.Printf("[download] файл слишком большой: url=%s size=%s", url, formatFileSize(info.Size()))
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Файл получился больше 50 МБ — Telegram не примет такой размер. Попробуй другую ссылку или качество.",
-		})
+		sendTextWithRetry(ctx, b, chatID, "Файл получился больше 50 МБ — Telegram не примет такой размер. Попробуй другую ссылку или качество.")
 		return
 	}
 
@@ -668,49 +773,9 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		caption = caption[:maxCaptionLen]
 	}
 
-	videoFile, err := os.Open(result.filePath)
-	if err != nil {
-		log.Printf("[download] ошибка открытия файла: url=%s err=%v", url, err)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Не удалось открыть скачанный файл.",
-		})
-		return
-	}
-	defer videoFile.Close()
-
-	_, sendErr := b.SendVideo(ctx, &bot.SendVideoParams{
-		ChatID:  chatID,
-		Video:   &models.InputFileUpload{Filename: filename, Data: videoFile},
-		Caption: caption,
-	})
-
-	if sendErr != nil {
-		log.Printf("[send] видео не ушло: url=%s err=%v, пробую документом", url, sendErr)
-
-		docFile, err := os.Open(result.filePath)
-		if err != nil {
-			log.Printf("[send] повторное открытие файла не удалось: url=%s err=%v", url, err)
-			b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatID,
-				Text:   "Скачал файл, но не получилось отправить.",
-			})
-			return
-		}
-		defer docFile.Close()
-
-		_, docErr := b.SendDocument(ctx, &bot.SendDocumentParams{
-			ChatID:   chatID,
-			Document: &models.InputFileUpload{Filename: filename, Data: docFile},
-			Caption:  caption,
-		})
-		if docErr != nil {
-			log.Printf("[send] документ не ушёл: url=%s err=%v", url, docErr)
-			b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatID,
-				Text:   "Скачал файл, но не получилось отправить.",
-			})
-		}
+	if err := sendVideoFile(ctx, b, chatID, result.filePath, filename, caption); err != nil {
+		log.Printf("[send] отправка не удалась: url=%s err=%v", url, err)
+		sendTextWithRetry(ctx, b, chatID, "Скачал файл, но не получилось отправить.")
 	} else {
 		log.Printf("[send] успешно: url=%s size=%s", url, sizeStr)
 	}
@@ -778,7 +843,63 @@ func getVideoDuration(parent context.Context, filePath string) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
 }
 
-func downloadVideo(parent context.Context, url string) (*downloadResult, error) {
+type progressFunc func(percent, downloaded, total, speed string)
+
+func runYtDlpDownload(ctx context.Context, args []string, onProgress progressFunc) (string, error) {
+	cmd := exec.CommandContext(ctx, ytDlpBin(), args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	var outputBuf bytes.Buffer
+	var outputMu sync.Mutex
+	var wg sync.WaitGroup
+
+	readLines := func(r io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "PROG:") && onProgress != nil {
+				parts := strings.SplitN(strings.TrimPrefix(line, "PROG:"), "|", 4)
+				if len(parts) == 4 {
+					onProgress(
+						strings.TrimSpace(parts[0]),
+						strings.TrimSpace(parts[1]),
+						strings.TrimSpace(parts[2]),
+						strings.TrimSpace(parts[3]),
+					)
+				}
+				continue
+			}
+			outputMu.Lock()
+			outputBuf.WriteString(line)
+			outputBuf.WriteByte('\n')
+			outputMu.Unlock()
+		}
+	}
+
+	wg.Add(2)
+	go readLines(stdout)
+	go readLines(stderr)
+
+	waitErr := cmd.Wait()
+	wg.Wait()
+
+	return outputBuf.String(), waitErr
+}
+
+func downloadVideo(parent context.Context, url string, onProgress progressFunc) (*downloadResult, error) {
 	ytDlp := ytDlpBin()
 	userAgent := ytDlpUserAgent()
 
@@ -852,19 +973,22 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 
 		log.Printf("[yt-dlp] попытка %d/%d: url=%s format=%s", i+1, len(formats), url, format)
 
-		cmd := exec.CommandContext(ctx, ytDlp,
+		args := []string{
 			"--no-playlist",
 			"-f", format,
 			"--merge-output-format", "mp4",
 			"--max-filesize", "50M",
 			"-o", outPath,
 			"--no-warnings",
+			"--newline",
+			"--progress-template",
+			"PROG:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s",
 			"--user-agent", userAgent,
 			url,
-		)
+		}
 
-		out, err := cmd.CombinedOutput()
-		raw := strings.TrimSpace(string(out))
+		out, err := runYtDlpDownload(ctx, args, onProgress)
+		raw := strings.TrimSpace(out)
 		if msg := extractYtDlpError(raw); msg != "" {
 			lastYtMsg = msg
 		}
