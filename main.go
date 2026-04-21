@@ -669,36 +669,52 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	statusMsg, _ := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
-		Text:   "Скачиваю видео…",
+		Text:   "Получаю информацию о видео…",
 	})
 
-	var progressMu sync.Mutex
-	var lastProgressText string
+	var statusMu sync.Mutex
+	var lastStatusText string
 	var lastProgressAt time.Time
-	var onProgress progressFunc
-	if statusMsg != nil {
-		onProgress = func(percent, downloaded, total, speed string) {
-			progressMu.Lock()
-			defer progressMu.Unlock()
-			if time.Since(lastProgressAt) < 2*time.Second {
-				return
-			}
-			text := fmt.Sprintf("Скачиваю: %s  %s/%s  %s", percent, downloaded, total, speed)
-			if text == lastProgressText {
-				return
-			}
-			lastProgressAt = time.Now()
-			lastProgressText = text
-			b.EditMessageText(ctx, &bot.EditMessageTextParams{
-				ChatID:    chatID,
-				MessageID: statusMsg.ID,
-				Text:      text,
-			})
+
+	setStatus := func(text string, isProgress bool) {
+		if statusMsg == nil {
+			return
 		}
+		statusMu.Lock()
+		defer statusMu.Unlock()
+		if isProgress && time.Since(lastProgressAt) < 2*time.Second {
+			return
+		}
+		if text == lastStatusText {
+			return
+		}
+		if isProgress {
+			lastProgressAt = time.Now()
+		}
+		lastStatusText = text
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID:    chatID,
+			MessageID: statusMsg.ID,
+			Text:      text,
+		})
+	}
+
+	onPhase := func(text string) { setStatus(text, false) }
+	onProgress := func(percent, downloaded, total, speed string) {
+		sizePart := downloaded
+		if total != "" && total != "N/A" {
+			sizePart = downloaded + "/" + total
+		}
+		text := "Скачиваю: " + percent + "  " + sizePart
+		if speed != "" && speed != "N/A" {
+			text += "  " + speed
+		}
+		text = strings.ReplaceAll(text, "iB", "B")
+		setStatus(text, true)
 	}
 
 	dlStart := time.Now()
-	result, err := downloadVideo(ctx, url, onProgress)
+	result, err := downloadVideo(ctx, url, onPhase, onProgress)
 	downloadDuration := time.Since(dlStart)
 
 	atomic.AddInt64(&statsAttempts, 1)
@@ -844,6 +860,7 @@ func getVideoDuration(parent context.Context, filePath string) time.Duration {
 }
 
 type progressFunc func(percent, downloaded, total, speed string)
+type phaseFunc func(text string)
 
 func runYtDlpDownload(ctx context.Context, args []string, onProgress progressFunc) (string, error) {
 	cmd := exec.CommandContext(ctx, ytDlpBin(), args...)
@@ -899,7 +916,7 @@ func runYtDlpDownload(ctx context.Context, args []string, onProgress progressFun
 	return outputBuf.String(), waitErr
 }
 
-func downloadVideo(parent context.Context, url string, onProgress progressFunc) (*downloadResult, error) {
+func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProgress progressFunc) (*downloadResult, error) {
 	ytDlp := ytDlpBin()
 	userAgent := ytDlpUserAgent()
 
@@ -947,6 +964,10 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 	var duration time.Duration
 	if vi.Duration > 0 {
 		duration = time.Duration(vi.Duration * float64(time.Second))
+	}
+
+	if onPhase != nil {
+		onPhase("Начинаю скачивание…")
 	}
 
 	formats := []string{
