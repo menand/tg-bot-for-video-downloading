@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -89,13 +90,31 @@ type downloadResult struct {
 }
 
 type videoInfo struct {
-	Title    string  `json:"title"`
-	Duration float64 `json:"duration"`
-	Height   int     `json:"height"`
-	Width    int     `json:"width"`
+	Title          string  `json:"title"`
+	Duration       float64 `json:"duration"`
+	Height         int     `json:"height"`
+	Width          int     `json:"width"`
+	Filesize       int64   `json:"filesize"`
+	FilesizeApprox int64   `json:"filesize_approx"`
 }
 
 var downloadSem = make(chan struct{}, maxConcurrentDownloads)
+
+var errVideoTooLarge = errors.New("видео превышает 50 MB")
+
+type ytDlpUserError struct{ msg string }
+
+func (e *ytDlpUserError) Error() string { return e.msg }
+
+func extractYtDlpError(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ERROR:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "ERROR:"))
+		}
+	}
+	return ""
+}
 
 type rotatingLogWriter struct {
 	mu   sync.Mutex
@@ -573,9 +592,19 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	if err != nil {
 		atomic.AddInt64(&statsErrors, 1)
 		log.Printf("[download] ошибка: url=%s за=%s err=%v", url, downloadDuration.Round(time.Millisecond), err)
+
+		userMsg := "Не удалось скачать видео. Проверь ссылку и доступность ролика (приватное, регион и т.д.)."
+		var ytErr *ytDlpUserError
+		switch {
+		case errors.Is(err, errVideoTooLarge):
+			userMsg = "Видео больше 50 МБ — Telegram не примет такой размер ни в одном качестве. Попробуй другое."
+		case errors.As(err, &ytErr):
+			userMsg = "Не удалось скачать: " + ytErr.msg
+		}
+
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
-			Text:   "Не удалось скачать видео. Проверь ссылку и доступность ролика (приватное, регион и т.д.).",
+			Text:   userMsg,
 		})
 		if statusMsg != nil {
 			b.DeleteMessage(ctx, &bot.DeleteMessageParams{
@@ -766,8 +795,12 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 	)
 	infoOutput, err := cmdInfo.CombinedOutput()
 	if err != nil {
+		raw := strings.TrimSpace(string(infoOutput))
 		log.Printf("[yt-dlp] dump-json ошибка: url=%s err=%v вывод=%q",
-			url, err, truncateStr(strings.TrimSpace(string(infoOutput)), 500))
+			url, err, truncateStr(raw, 500))
+		if msg := extractYtDlpError(raw); msg != "" {
+			return nil, &ytDlpUserError{msg: msg}
+		}
 		return nil, fmt.Errorf("не удалось получить информацию о видео: %v", err)
 	}
 
@@ -779,6 +812,16 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 	}
 
 	log.Printf("[yt-dlp] информация: url=%s title=%q duration=%.1fs", url, vi.Title, vi.Duration)
+
+	const maxBytes = int64(maxFileSizeMB) * 1024 * 1024
+	knownSize := vi.Filesize
+	if knownSize == 0 {
+		knownSize = vi.FilesizeApprox
+	}
+	if knownSize > maxBytes {
+		log.Printf("[yt-dlp] файл заведомо больше %dMB: url=%s filesize=%s", maxFileSizeMB, url, formatFileSize(knownSize))
+		return nil, errVideoTooLarge
+	}
 
 	var duration time.Duration
 	if vi.Duration > 0 {
@@ -793,6 +836,8 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 	}
 
 	var lastErr error
+	var lastYtMsg string
+	var sawPartOnly bool
 	var dir string
 	for i, format := range formats {
 		if dir != "" {
@@ -819,14 +864,18 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 		)
 
 		out, err := cmd.CombinedOutput()
+		raw := strings.TrimSpace(string(out))
+		if msg := extractYtDlpError(raw); msg != "" {
+			lastYtMsg = msg
+		}
 		if err != nil {
-			raw := strings.TrimSpace(string(out))
 			log.Printf("[yt-dlp] попытка %d неудача: url=%s format=%s err=%v вывод=%q", i+1, url, format, err, truncateStr(raw, 500))
 			lastErr = err
 			continue
 		}
 
 		entries, _ := os.ReadDir(dir)
+		hasPart := false
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -834,6 +883,9 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 			name := e.Name()
 			if strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".ytdl") {
 				log.Printf("[yt-dlp] пропуск temp-файла: %s", name)
+				if strings.HasSuffix(name, ".part") {
+					hasPart = true
+				}
 				continue
 			}
 			fi, _ := e.Info()
@@ -842,11 +894,20 @@ func downloadVideo(parent context.Context, url string) (*downloadResult, error) 
 			return &downloadResult{filePath: filepath.Join(dir, name), duration: duration, width: vi.Width, height: vi.Height}, nil
 		}
 
+		if hasPart {
+			sawPartOnly = true
+		}
 		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
 	}
 
 	if dir != "" {
 		os.RemoveAll(dir)
+	}
+	if sawPartOnly {
+		return nil, errVideoTooLarge
+	}
+	if lastYtMsg != "" {
+		return nil, &ytDlpUserError{msg: lastYtMsg}
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("ошибка скачивания (все качества)")
