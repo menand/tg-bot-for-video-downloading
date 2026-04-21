@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unicode"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -39,11 +38,15 @@ var (
 	startTime    time.Time
 	adminChatID  int64
 	shutdownFunc context.CancelFunc
-	botInstance  *bot.Bot
 	logPath      = "/data/bot.log"
 
-	statsDownloads int64
-	statsErrors    int64
+	statsAttempts int64
+	statsErrors   int64
+
+	downloadWG sync.WaitGroup
+
+	perChatMu     sync.Mutex
+	perChatActive = map[int64]struct{}{}
 )
 
 type botSettings struct {
@@ -55,14 +58,27 @@ var settings = botSettings{StartupNotify: true}
 func loadSettings() {
 	data, err := os.ReadFile(settingsPath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Ошибка чтения настроек (%s): %v", settingsPath, err)
+		}
 		return
 	}
-	json.Unmarshal(data, &settings)
+	if err := json.Unmarshal(data, &settings); err != nil {
+		log.Printf("Ошибка парсинга настроек (%s): %v", settingsPath, err)
+	}
 }
 
-func saveSettings() {
-	data, _ := json.Marshal(settings)
-	os.WriteFile(settingsPath, data, 0644)
+func saveSettings() error {
+	data, err := json.Marshal(settings)
+	if err != nil {
+		log.Printf("Ошибка сериализации настроек: %v", err)
+		return err
+	}
+	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
+		log.Printf("Ошибка записи настроек (%s): %v", settingsPath, err)
+		return err
+	}
+	return nil
 }
 
 type downloadResult struct {
@@ -105,12 +121,30 @@ func (w *rotatingLogWriter) Write(p []byte) (int, error) {
 	}
 
 	if info.Size()+int64(len(p)) > maxLogSize {
-		w.file.Close()
-		data, err := os.ReadFile(w.path)
-		if err != nil {
-			w.file, _ = os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-			return w.file.Write(p)
+		if err := w.rotateLocked(); err != nil {
+			fmt.Fprintf(os.Stderr, "rotatingLogWriter: ротация не удалась: %v\n", err)
 		}
+	}
+
+	return w.file.Write(p)
+}
+
+func (w *rotatingLogWriter) rotateLocked() error {
+	data, readErr := os.ReadFile(w.path)
+	w.file.Close()
+
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		f2, err2 := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err2 != nil {
+			return fmt.Errorf("reopen truncated: %v; fallback append: %v", err, err2)
+		}
+		w.file = f2
+		return err
+	}
+	w.file = f
+
+	if readErr == nil {
 		keep := len(data) / 2
 		for keep < len(data) && data[keep] != '\n' {
 			keep++
@@ -118,11 +152,9 @@ func (w *rotatingLogWriter) Write(p []byte) (int, error) {
 		if keep < len(data) {
 			keep++
 		}
-		w.file, _ = os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-		w.file.Write(data[keep:])
+		f.Write(data[keep:])
 	}
-
-	return w.file.Write(p)
+	return nil
 }
 
 func (w *rotatingLogWriter) Close() error {
@@ -165,12 +197,35 @@ func ytDlpBin() string {
 	return "yt-dlp"
 }
 
+func ytDlpUserAgent() string {
+	if ua := os.Getenv("YT_DLP_USER_AGENT"); ua != "" {
+		return ua
+	}
+	return "Mozilla/5.0 (Windows NT 10.0; rv:131.0) Gecko/20100101 Firefox/131.0"
+}
+
 func isAdmin(userID int64) bool {
 	return adminChatID != 0 && userID == adminChatID
 }
 
 func currentDownloads() int {
 	return len(downloadSem)
+}
+
+func acquireChatSlot(chatID int64) bool {
+	perChatMu.Lock()
+	defer perChatMu.Unlock()
+	if _, ok := perChatActive[chatID]; ok {
+		return false
+	}
+	perChatActive[chatID] = struct{}{}
+	return true
+}
+
+func releaseChatSlot(chatID int64) {
+	perChatMu.Lock()
+	delete(perChatActive, chatID)
+	perChatMu.Unlock()
 }
 
 func main() {
@@ -189,7 +244,19 @@ func main() {
 		log.Fatal("Установите TELEGRAM_BOT_TOKEN в файле .env или в переменной окружения")
 	}
 
-	adminChatID, _ = strconv.ParseInt(os.Getenv("ADMIN_CHAT_ID"), 10, 64)
+	if adminStr := os.Getenv("ADMIN_CHAT_ID"); adminStr != "" {
+		id, err := strconv.ParseInt(adminStr, 10, 64)
+		if err != nil {
+			log.Printf("ВНИМАНИЕ: ADMIN_CHAT_ID=%q не парсится как число: %v — админ-команды отключены", adminStr, err)
+		} else {
+			adminChatID = id
+		}
+	}
+
+	ytVer := ytDlpVersion(context.Background())
+	if ytVer == "неизвестно" {
+		log.Fatalf("yt-dlp не найден или не работает (путь: %q). Установите yt-dlp или задайте YT_DLP_BIN", ytDlpBin())
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -209,8 +276,6 @@ func main() {
 		log.Fatalf("Ошибка создания бота: %v", err)
 	}
 
-	botInstance = b
-
 	loadSettings()
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startCmd)
@@ -223,7 +288,6 @@ func main() {
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/notify", bot.MatchTypeExact, notifyCmd)
 
 	startTime = time.Now()
-	ytVer := ytDlpVersion()
 	log.Printf("Бот запущен (admin=%d, yt-dlp=%s)", adminChatID, ytVer)
 
 	if adminChatID != 0 && settings.StartupNotify {
@@ -234,6 +298,20 @@ func main() {
 	}
 
 	b.Start(ctx)
+
+	log.Println("Ожидание завершения активных скачиваний…")
+	done := make(chan struct{})
+	go func() {
+		downloadWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Println("Все скачивания завершены")
+	case <-time.After(30 * time.Second):
+		log.Println("Таймаут ожидания (30с), принудительный выход")
+	}
+
 	log.Println("Бот остановлен")
 }
 
@@ -253,16 +331,11 @@ func senderInfo(update *models.Update) string {
 	if u.LastName != "" {
 		name += " " + u.LastName
 	}
-	nick := ""
+	nickSuffix := ""
 	if u.Username != "" {
-		nick = "@" + u.Username
+		nickSuffix = ", nick - @" + u.Username
 	}
-	return fmt.Sprintf("Пользователь: Имя - %s, id - %d%s", name, u.ID, func() string {
-		if nick != "" {
-			return ", nick - " + nick
-		}
-		return ""
-	}())
+	return fmt.Sprintf("Пользователь: Имя - %s, id - %d%s", name, u.ID, nickSuffix)
 }
 
 func startCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -296,12 +369,13 @@ func statsCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 	if !isAdmin(senderID(update)) {
 		return
 	}
-	dl := atomic.LoadInt64(&statsDownloads)
+	attempts := atomic.LoadInt64(&statsAttempts)
 	errs := atomic.LoadInt64(&statsErrors)
+	successes := attempts - errs
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
-		Text: fmt.Sprintf("Статистика:\nСкачиваний: %d\nОшибок: %d\nУспешность: %d%%\nВремя работы: %s",
-			dl, errs, successRate(dl, errs), formatUptimeShort(time.Since(startTime))),
+		Text: fmt.Sprintf("Статистика:\nПопыток: %d\nУспешно: %d\nОшибок: %d\nУспешность: %d%%\nВремя работы: %s",
+			attempts, successes, errs, successRate(attempts, errs), formatUptimeShort(time.Since(startTime))),
 	})
 }
 
@@ -310,7 +384,7 @@ func statusCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 		return
 	}
 	active := currentDownloads()
-	ytVer := ytDlpVersion()
+	ytVer := ytDlpVersion(ctx)
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text: fmt.Sprintf("Состояние:\nАктивных скачиваний: %d/%d\nyt-dlp: %s\nUptime: %s",
@@ -373,7 +447,14 @@ func notifyCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 		return
 	}
 	settings.StartupNotify = !settings.StartupNotify
-	saveSettings()
+	if err := saveSettings(); err != nil {
+		settings.StartupNotify = !settings.StartupNotify
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   fmt.Sprintf("Не удалось сохранить настройку: %v", err),
+		})
+		return
+	}
 
 	state := "выключено"
 	if settings.StartupNotify {
@@ -399,6 +480,7 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	if url := extractFirstURL(text); url != "" {
 		log.Printf("—————————")
 		log.Printf("[url] %s запросил скачивание: %s", senderInfo(update), url)
+		downloadWG.Add(1)
 		go handleVideoURL(ctx, b, update.Message.Chat.ID, url)
 		return
 	}
@@ -417,31 +499,14 @@ func successRate(dl, errs int64) int64 {
 	return (dl - errs) * 100 / dl
 }
 
-func ytDlpVersion() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func ytDlpVersion(parent context.Context) string {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, ytDlpBin(), "--version").Output()
 	if err != nil {
 		return "неизвестно"
 	}
 	return strings.TrimSpace(string(out))
-}
-
-func formatUptime(d time.Duration) string {
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-
-	if h > 0 {
-		return fmt.Sprintf("Бот работает: %dч %dм %dс", h, m, s)
-	}
-	if m > 0 {
-		return fmt.Sprintf("Бот работает: %dм %dс", m, s)
-	}
-	return fmt.Sprintf("Бот работает: %dс", s)
 }
 
 func formatUptimeShort(d time.Duration) string {
@@ -468,6 +533,18 @@ func extractFirstURL(text string) string {
 }
 
 func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
+	defer downloadWG.Done()
+
+	if !acquireChatSlot(chatID) {
+		log.Printf("[download] отклонён: per-chat limit (chatID=%d, url=%s)", chatID, url)
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "У тебя уже идёт скачивание, дождись его завершения.",
+		})
+		return
+	}
+	defer releaseChatSlot(chatID)
+
 	select {
 	case downloadSem <- struct{}{}:
 	default:
@@ -488,10 +565,10 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	})
 
 	dlStart := time.Now()
-	result, err := downloadVideo(url)
+	result, err := downloadVideo(ctx, url)
 	downloadDuration := time.Since(dlStart)
 
-	atomic.AddInt64(&statsDownloads, 1)
+	atomic.AddInt64(&statsAttempts, 1)
 
 	if err != nil {
 		atomic.AddInt64(&statsErrors, 1)
@@ -543,7 +620,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	duration := result.duration
 	if duration == 0 {
-		duration = getVideoDuration(result.filePath)
+		duration = getVideoDuration(ctx, result.filePath)
 	}
 
 	filename := filepath.Base(result.filePath)
@@ -562,27 +639,40 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		caption = caption[:maxCaptionLen]
 	}
 
-	fileContent, err := os.ReadFile(result.filePath)
+	videoFile, err := os.Open(result.filePath)
 	if err != nil {
-		log.Printf("[download] ошибка чтения файла: url=%s err=%v", url, err)
+		log.Printf("[download] ошибка открытия файла: url=%s err=%v", url, err)
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
-			Text:   "Не удалось прочитать скачанный файл.",
+			Text:   "Не удалось открыть скачанный файл.",
 		})
 		return
 	}
+	defer videoFile.Close()
 
 	_, sendErr := b.SendVideo(ctx, &bot.SendVideoParams{
 		ChatID:  chatID,
-		Video:   &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(fileContent)},
+		Video:   &models.InputFileUpload{Filename: filename, Data: videoFile},
 		Caption: caption,
 	})
 
 	if sendErr != nil {
 		log.Printf("[send] видео не ушло: url=%s err=%v, пробую документом", url, sendErr)
+
+		docFile, err := os.Open(result.filePath)
+		if err != nil {
+			log.Printf("[send] повторное открытие файла не удалось: url=%s err=%v", url, err)
+			b.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Скачал файл, но не получилось отправить.",
+			})
+			return
+		}
+		defer docFile.Close()
+
 		_, docErr := b.SendDocument(ctx, &bot.SendDocumentParams{
 			ChatID:   chatID,
-			Document: &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(fileContent)},
+			Document: &models.InputFileUpload{Filename: filename, Data: docFile},
 			Caption:  caption,
 		})
 		if docErr != nil {
@@ -634,8 +724,8 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", m, s)
 }
 
-func getVideoDuration(filePath string) time.Duration {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func getVideoDuration(parent context.Context, filePath string) time.Duration {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "ffprobe",
@@ -659,15 +749,11 @@ func getVideoDuration(filePath string) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
 }
 
-func downloadVideo(url string) (*downloadResult, error) {
+func downloadVideo(parent context.Context, url string) (*downloadResult, error) {
 	ytDlp := ytDlpBin()
+	userAgent := ytDlpUserAgent()
 
-	dir, err := os.MkdirTemp("", "tg-video-*")
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	ctx, cancel := context.WithTimeout(parent, downloadTimeout)
 	defer cancel()
 
 	log.Printf("[yt-dlp] получение информации: url=%s", url)
@@ -678,10 +764,10 @@ func downloadVideo(url string) (*downloadResult, error) {
 		"--no-warnings",
 		url,
 	)
-	infoOutput, err := cmdInfo.Output()
+	infoOutput, err := cmdInfo.CombinedOutput()
 	if err != nil {
-		os.RemoveAll(dir)
-		log.Printf("[yt-dlp] dump-json ошибка: url=%s err=%v", url, err)
+		log.Printf("[yt-dlp] dump-json ошибка: url=%s err=%v вывод=%q",
+			url, err, truncateStr(strings.TrimSpace(string(infoOutput)), 500))
 		return nil, fmt.Errorf("не удалось получить информацию о видео: %v", err)
 	}
 
@@ -693,12 +779,6 @@ func downloadVideo(url string) (*downloadResult, error) {
 	}
 
 	log.Printf("[yt-dlp] информация: url=%s title=%q duration=%.1fs", url, vi.Title, vi.Duration)
-
-	title := vi.Title
-	if title == "" {
-		title = "video"
-	}
-	title = sanitizeFilename(title)
 
 	var duration time.Duration
 	if vi.Duration > 0 {
@@ -713,9 +793,16 @@ func downloadVideo(url string) (*downloadResult, error) {
 	}
 
 	var lastErr error
+	var dir string
 	for i, format := range formats {
-		os.RemoveAll(dir)
-		dir, _ = os.MkdirTemp("", "tg-video-*")
+		if dir != "" {
+			os.RemoveAll(dir)
+		}
+		var mkErr error
+		dir, mkErr = os.MkdirTemp("", "tg-video-*")
+		if mkErr != nil {
+			return nil, fmt.Errorf("не удалось создать временную директорию: %v", mkErr)
+		}
 		outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
 
 		log.Printf("[yt-dlp] попытка %d/%d: url=%s format=%s", i+1, len(formats), url, format)
@@ -727,10 +814,9 @@ func downloadVideo(url string) (*downloadResult, error) {
 			"--max-filesize", "50M",
 			"-o", outPath,
 			"--no-warnings",
-			"--user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:131.0) Gecko/20100101 Firefox/131.0",
+			"--user-agent", userAgent,
 			url,
 		)
-		cmd.Dir = dir
 
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -759,7 +845,9 @@ func downloadVideo(url string) (*downloadResult, error) {
 		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
 	}
 
-	os.RemoveAll(dir)
+	if dir != "" {
+		os.RemoveAll(dir)
+	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("ошибка скачивания (все качества)")
 	}
@@ -771,25 +859,4 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "…"
-}
-
-func sanitizeFilename(name string) string {
-	result := strings.Map(func(r rune) rune {
-		if isFilenameSafe(r) {
-			return r
-		}
-		return -1
-	}, name)
-	result = strings.TrimSpace(result)
-	if result == "" {
-		return "video"
-	}
-	return result
-}
-
-func isFilenameSafe(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-		(r >= '0' && r <= '9') ||
-		r == ' ' || r == '-' || r == '_' || r == '.' ||
-		(unicode.IsLetter(r) && unicode.IsPrint(r))
 }
