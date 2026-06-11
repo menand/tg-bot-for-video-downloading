@@ -8,18 +8,13 @@ RUN CGO_ENABLED=0 go build -o /telegram-bot .
 
 FROM alpine:3.23
 
-RUN apk add --no-cache ca-certificates ffmpeg
+RUN apk add --no-cache ca-certificates ffmpeg python3 py3-pip
 
-ARG YT_DLP_VERSION=2026.06.09
-RUN arch="$(uname -m)" && \
-    case "$arch" in \
-        x86_64)  bin="yt-dlp_musllinux" ;; \
-        aarch64) bin="yt-dlp_musllinux_aarch64" ;; \
-        *)       echo "Unsupported arch: $arch" && exit 1 ;; \
-    esac && \
-    wget -q "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${bin}" \
-         -O /usr/local/bin/yt-dlp && \
-    chmod +x /usr/local/bin/yt-dlp && \
+# yt-dlp через pip, а не PyInstaller-бинарём с GitHub: тот распаковывает себя
+# при каждом запуске (десятки секунд на слабом VPS), pip-версия стартует ~1с.
+# Формат версии у pip — 2026.6.9 (без ведущих нулей), а не тег релиза 2026.06.09.
+ARG YT_DLP_VERSION=2026.6.9
+RUN pip install --no-cache-dir --break-system-packages yt-dlp==${YT_DLP_VERSION} && \
     yt-dlp --version
 
 RUN adduser -D -g '' botuser && \

@@ -109,4 +109,4 @@ docker compose down
 git pull && docker compose down && docker-compose up -d --build
 ```
 
-Версия yt-dlp пиннится в Dockerfile (`YT_DLP_VERSION`), обновляй вручную.
+Версия yt-dlp пиннится в Dockerfile (`YT_DLP_VERSION`, pip-формат вида `2026.6.9`), обновляй вручную.
