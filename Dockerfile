@@ -10,7 +10,7 @@ FROM alpine:3.23
 
 RUN apk add --no-cache ca-certificates ffmpeg
 
-ARG YT_DLP_VERSION=2026.03.17
+ARG YT_DLP_VERSION=2026.06.09
 RUN arch="$(uname -m)" && \
     case "$arch" in \
         x86_64)  bin="yt-dlp_musllinux" ;; \

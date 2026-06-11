@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -31,6 +32,7 @@ const (
 	downloadTimeout        = 10 * time.Minute
 	maxConcurrentDownloads = 3
 	maxLogSize             = 5 * 1024 * 1024
+	maxYtDlpOutput         = 256 * 1024
 	settingsPath           = "/data/bot-settings.json"
 )
 
@@ -48,13 +50,18 @@ var (
 
 	perChatMu     sync.Mutex
 	perChatActive = map[int64]struct{}{}
+
+	allowedUserIDs map[int64]struct{} // пусто — скачивание доступно всем
 )
 
 type botSettings struct {
 	StartupNotify bool `json:"startup_notify"`
 }
 
-var settings = botSettings{StartupNotify: true}
+var (
+	settingsMu sync.Mutex
+	settings   = botSettings{StartupNotify: true}
+)
 
 func loadSettings() {
 	data, err := os.ReadFile(settingsPath)
@@ -149,7 +156,11 @@ func (w *rotatingLogWriter) Write(p []byte) (int, error) {
 }
 
 func (w *rotatingLogWriter) rotateLocked() error {
-	data, readErr := os.ReadFile(w.path)
+	data, err := os.ReadFile(w.path)
+	if err != nil {
+		// файл не читается — не трогаем его: лучше превысить лимит, чем потерять лог
+		return fmt.Errorf("чтение лога перед ротацией: %w", err)
+	}
 	w.file.Close()
 
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -163,16 +174,14 @@ func (w *rotatingLogWriter) rotateLocked() error {
 	}
 	w.file = f
 
-	if readErr == nil {
-		keep := len(data) / 2
-		for keep < len(data) && data[keep] != '\n' {
-			keep++
-		}
-		if keep < len(data) {
-			keep++
-		}
-		f.Write(data[keep:])
+	keep := len(data) / 2
+	for keep < len(data) && data[keep] != '\n' {
+		keep++
 	}
+	if keep < len(data) {
+		keep++
+	}
+	f.Write(data[keep:])
 	return nil
 }
 
@@ -227,6 +236,17 @@ func isAdmin(userID int64) bool {
 	return adminChatID != 0 && userID == adminChatID
 }
 
+func userAllowed(userID int64) bool {
+	if allowedUserIDs == nil {
+		return true
+	}
+	if isAdmin(userID) {
+		return true
+	}
+	_, ok := allowedUserIDs[userID]
+	return ok
+}
+
 func currentDownloads() int {
 	return len(downloadSem)
 }
@@ -245,6 +265,18 @@ func releaseChatSlot(chatID int64) {
 	perChatMu.Lock()
 	delete(perChatActive, chatID)
 	perChatMu.Unlock()
+}
+
+// убирает tg-video-* директории, оставшиеся после аварийного завершения
+func cleanupOrphanTempDirs() {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "tg-video-*"))
+	if err != nil || len(matches) == 0 {
+		return
+	}
+	for _, m := range matches {
+		os.RemoveAll(m)
+	}
+	log.Printf("Удалены осиротевшие временные директории: %d", len(matches))
 }
 
 func main() {
@@ -272,6 +304,27 @@ func main() {
 		}
 	}
 
+	if idsStr := os.Getenv("ALLOWED_USER_IDS"); idsStr != "" {
+		allowedUserIDs = make(map[int64]struct{})
+		for _, p := range strings.Split(idsStr, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(p, 10, 64)
+			if err != nil {
+				log.Printf("ВНИМАНИЕ: ALLOWED_USER_IDS: %q не парсится как число — пропускаю", p)
+				continue
+			}
+			allowedUserIDs[id] = struct{}{}
+		}
+		if len(allowedUserIDs) == 0 {
+			log.Printf("ВНИМАНИЕ: ALLOWED_USER_IDS задан, но ни один ID не распознан — скачивание доступно только админу")
+		} else {
+			log.Printf("Белый список пользователей: %d ID", len(allowedUserIDs))
+		}
+	}
+
 	ytVer := ytDlpVersion(context.Background())
 	if ytVer == "неизвестно" {
 		log.Fatalf("yt-dlp не найден или не работает (путь: %q). Установите yt-dlp или задайте YT_DLP_BIN", ytDlpBin())
@@ -296,6 +349,7 @@ func main() {
 	}
 
 	loadSettings()
+	cleanupOrphanTempDirs()
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startCmd)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/help", bot.MatchTypeExact, helpCmd)
@@ -465,9 +519,16 @@ func notifyCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 	if !isAdmin(senderID(update)) {
 		return
 	}
+	settingsMu.Lock()
 	settings.StartupNotify = !settings.StartupNotify
-	if err := saveSettings(); err != nil {
+	err := saveSettings()
+	if err != nil {
 		settings.StartupNotify = !settings.StartupNotify
+	}
+	enabled := settings.StartupNotify
+	settingsMu.Unlock()
+
+	if err != nil {
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: update.Message.Chat.ID,
 			Text:   fmt.Sprintf("Не удалось сохранить настройку: %v", err),
@@ -476,7 +537,7 @@ func notifyCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 
 	state := "выключено"
-	if settings.StartupNotify {
+	if enabled {
 		state = "включено"
 	}
 	b.SendMessage(ctx, &bot.SendMessageParams{
@@ -497,6 +558,15 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 
 	if url := extractFirstURL(text); url != "" {
+		uid := senderID(update)
+		if !userAllowed(uid) {
+			log.Printf("[access] отказ: %s, url=%s", senderInfo(update), url)
+			b.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID: update.Message.Chat.ID,
+				Text:   fmt.Sprintf("Это приватный бот, скачивание недоступно. Твой ID: %d — попроси владельца открыть доступ.", uid),
+			})
+			return
+		}
 		log.Printf("—————————")
 		log.Printf("[url] %s запросил скачивание: %s", senderInfo(update), url)
 		downloadWG.Add(1)
@@ -610,22 +680,28 @@ func sendTextWithRetry(ctx context.Context, b *bot.Bot, chatID int64, text strin
 	}
 }
 
-func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, filePath, filename, caption string) error {
+func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, caption string, result *downloadResult, duration time.Duration) error {
+	filename := filepath.Base(result.filePath)
+
 	asVideo := func() error {
-		f, err := os.Open(filePath)
+		f, err := os.Open(result.filePath)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
 		_, err = b.SendVideo(ctx, &bot.SendVideoParams{
-			ChatID:  chatID,
-			Video:   &models.InputFileUpload{Filename: filename, Data: f},
-			Caption: caption,
+			ChatID:            chatID,
+			Video:             &models.InputFileUpload{Filename: filename, Data: f},
+			Caption:           caption,
+			Duration:          int(duration.Seconds()),
+			Width:             result.width,
+			Height:            result.height,
+			SupportsStreaming: true,
 		})
 		return err
 	}
 	asDocument := func() error {
-		f, err := os.Open(filePath)
+		f, err := os.Open(result.filePath)
 		if err != nil {
 			return err
 		}
@@ -671,6 +747,14 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		ChatID: chatID,
 		Text:   "Получаю информацию о видео…",
 	})
+	defer func() {
+		if statusMsg != nil {
+			b.DeleteMessage(ctx, &bot.DeleteMessageParams{
+				ChatID:    chatID,
+				MessageID: statusMsg.ID,
+			})
+		}
+	}()
 
 	var statusMu sync.Mutex
 	var lastStatusText string
@@ -717,6 +801,12 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	result, err := downloadVideo(ctx, url, onPhase, onProgress)
 	downloadDuration := time.Since(dlStart)
 
+	if errors.Is(err, context.Canceled) {
+		// остановка бота: сообщения уже не дойдут, в статистику не считаем
+		log.Printf("[download] отменено: url=%s", url)
+		return
+	}
+
 	atomic.AddInt64(&statsAttempts, 1)
 
 	if err != nil {
@@ -728,28 +818,17 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		switch {
 		case errors.Is(err, errVideoTooLarge):
 			userMsg = "Видео больше 50 МБ — Telegram не примет такой размер ни в одном качестве. Попробуй другое."
+		case errors.Is(err, context.DeadlineExceeded):
+			userMsg = "Скачивание не уложилось в лимит 10 минут. Попробуй ролик покороче."
 		case errors.As(err, &ytErr):
 			userMsg = "Не удалось скачать: " + ytErr.msg
 		}
 
 		sendTextWithRetry(ctx, b, chatID, userMsg)
-		if statusMsg != nil {
-			b.DeleteMessage(ctx, &bot.DeleteMessageParams{
-				ChatID:    chatID,
-				MessageID: statusMsg.ID,
-			})
-		}
 		return
 	}
 
 	defer os.RemoveAll(filepath.Dir(result.filePath))
-
-	if statusMsg != nil {
-		b.DeleteMessage(ctx, &bot.DeleteMessageParams{
-			ChatID:    chatID,
-			MessageID: statusMsg.ID,
-		})
-	}
 
 	info, err := os.Stat(result.filePath)
 	if err != nil {
@@ -785,11 +864,10 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	caption := fmt.Sprintf("📹 %s\n⏱ Длительность: %s%s\n💾 Размер: %s\n⚡ Обработано за: %s",
 		filename, durationStr, resStr, sizeStr, downloadTimeStr)
-	if len(caption) > maxCaptionLen {
-		caption = caption[:maxCaptionLen]
-	}
+	caption = truncateUTF8(caption, maxCaptionLen)
 
-	if err := sendVideoFile(ctx, b, chatID, result.filePath, filename, caption); err != nil {
+	onPhase("Отправляю видео…")
+	if err := sendVideoFile(ctx, b, chatID, caption, result, duration); err != nil {
 		log.Printf("[send] отправка не удалась: url=%s err=%v", url, err)
 		sendTextWithRetry(ctx, b, chatID, "Скачал файл, но не получилось отправить.")
 	} else {
@@ -862,58 +940,79 @@ func getVideoDuration(parent context.Context, filePath string) time.Duration {
 type progressFunc func(percent, downloaded, total, speed string)
 type phaseFunc func(text string)
 
+// lineWriter режет поток на строки и передаёт их в emit построчно
+type lineWriter struct {
+	buf  []byte
+	emit func(line string)
+}
+
+func (lw *lineWriter) Write(p []byte) (int, error) {
+	lw.buf = append(lw.buf, p...)
+	for {
+		i := bytes.IndexByte(lw.buf, '\n')
+		if i < 0 {
+			break
+		}
+		lw.emit(strings.TrimSuffix(string(lw.buf[:i]), "\r"))
+		lw.buf = lw.buf[i+1:]
+	}
+	// ffmpeg пишет прогресс через \r без \n — не даём буферу расти бесконечно
+	if len(lw.buf) > 64*1024 {
+		lw.emit(string(lw.buf))
+		lw.buf = nil
+	}
+	return len(p), nil
+}
+
+func (lw *lineWriter) flush() {
+	if len(lw.buf) > 0 {
+		lw.emit(strings.TrimSuffix(string(lw.buf), "\r"))
+		lw.buf = nil
+	}
+}
+
 func runYtDlpDownload(ctx context.Context, args []string, onProgress progressFunc) (string, error) {
-	cmd := exec.CommandContext(ctx, ytDlpBin(), args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-
 	var outputBuf bytes.Buffer
 	var outputMu sync.Mutex
-	var wg sync.WaitGroup
 
-	readLines := func(r io.Reader) {
-		defer wg.Done()
-		scanner := bufio.NewScanner(r)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "PROG:") && onProgress != nil {
-				parts := strings.SplitN(strings.TrimPrefix(line, "PROG:"), "|", 4)
-				if len(parts) == 4 {
-					onProgress(
-						strings.TrimSpace(parts[0]),
-						strings.TrimSpace(parts[1]),
-						strings.TrimSpace(parts[2]),
-						strings.TrimSpace(parts[3]),
-					)
-				}
-				continue
+	emit := func(line string) {
+		if strings.HasPrefix(line, "PROG:") && onProgress != nil {
+			parts := strings.SplitN(strings.TrimPrefix(line, "PROG:"), "|", 4)
+			if len(parts) == 4 {
+				onProgress(
+					strings.TrimSpace(parts[0]),
+					strings.TrimSpace(parts[1]),
+					strings.TrimSpace(parts[2]),
+					strings.TrimSpace(parts[3]),
+				)
 			}
-			outputMu.Lock()
+			return
+		}
+		outputMu.Lock()
+		if outputBuf.Len() < maxYtDlpOutput { // защита от бесконечного прогресс-спама в памяти
 			outputBuf.WriteString(line)
 			outputBuf.WriteByte('\n')
-			outputMu.Unlock()
 		}
+		outputMu.Unlock()
 	}
 
-	wg.Add(2)
-	go readLines(stdout)
-	go readLines(stderr)
+	cmd := exec.CommandContext(ctx, ytDlpBin(), args...)
+	stdoutW := &lineWriter{emit: emit}
+	stderrW := &lineWriter{emit: emit}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+	// если yt-dlp оставил живых потомков (ffmpeg), держащих пайпы, — не ждать их вечно
+	cmd.WaitDelay = 5 * time.Second
 
-	waitErr := cmd.Wait()
-	wg.Wait()
+	err := cmd.Run()
+	stdoutW.flush()
+	stderrW.flush()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// сам процесс завершился успешно, пайп держал потомок — не считаем ошибкой
+		err = nil
+	}
 
-	return outputBuf.String(), waitErr
+	return outputBuf.String(), err
 }
 
 func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProgress progressFunc) (*downloadResult, error) {
@@ -929,10 +1028,14 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 		"--no-playlist",
 		"--dump-json",
 		"--no-warnings",
+		"--",
 		url,
 	)
 	infoOutput, err := cmdInfo.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		raw := strings.TrimSpace(string(infoOutput))
 		log.Printf("[yt-dlp] dump-json ошибка: url=%s err=%v вывод=%q",
 			url, err, truncateStr(raw, 500))
@@ -979,9 +1082,12 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 
 	var lastErr error
 	var lastYtMsg string
-	var sawPartOnly bool
+	var sawTooLarge bool
 	var dir string
 	for i, format := range formats {
+		if ctx.Err() != nil {
+			break
+		}
 		if dir != "" {
 			os.RemoveAll(dir)
 		}
@@ -1005,6 +1111,7 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 			"--progress-template",
 			"PROG:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s",
 			"--user-agent", userAgent,
+			"--",
 			url,
 		}
 
@@ -1012,6 +1119,10 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 		raw := strings.TrimSpace(out)
 		if msg := extractYtDlpError(raw); msg != "" {
 			lastYtMsg = msg
+		}
+		// при превышении --max-filesize yt-dlp пишет "File is larger than max-filesize" и выходит с кодом 0
+		if err == nil && strings.Contains(raw, "larger than max-filesize") {
+			sawTooLarge = true
 		}
 		if err != nil {
 			log.Printf("[yt-dlp] попытка %d неудача: url=%s format=%s err=%v вывод=%q", i+1, url, format, err, truncateStr(raw, 500))
@@ -1033,14 +1144,17 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 				}
 				continue
 			}
-			fi, _ := e.Info()
+			var size int64
+			if fi, err := e.Info(); err == nil {
+				size = fi.Size()
+			}
 			log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
-				i+1, url, format, name, formatFileSize(fi.Size()))
+				i+1, url, format, name, formatFileSize(size))
 			return &downloadResult{filePath: filepath.Join(dir, name), duration: duration, width: vi.Width, height: vi.Height}, nil
 		}
 
 		if hasPart {
-			sawPartOnly = true
+			sawTooLarge = true
 		}
 		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
 	}
@@ -1048,21 +1162,36 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 	if dir != "" {
 		os.RemoveAll(dir)
 	}
-	if sawPartOnly {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if sawTooLarge {
 		return nil, errVideoTooLarge
 	}
 	if lastYtMsg != "" {
 		return nil, &ytDlpUserError{msg: lastYtMsg}
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("ошибка скачивания (все качества)")
+		return nil, fmt.Errorf("ошибка скачивания (все качества): %w", lastErr)
 	}
 	return nil, os.ErrNotExist
+}
+
+// truncateUTF8 обрезает строку до max байт, не разрывая UTF-8 символ
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func truncateStr(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "…"
+	return truncateUTF8(s, maxLen) + "…"
 }
