@@ -325,7 +325,8 @@ func main() {
 		}
 	}
 
-	ytVer := ytDlpVersion(context.Background())
+	// PyInstaller-бинарь yt-dlp при холодном старте на слабом VPS распаковывается десятки секунд
+	ytVer := ytDlpVersion(context.Background(), 60*time.Second)
 	if ytVer == "неизвестно" {
 		log.Fatalf("yt-dlp не найден или не работает (путь: %q). Установите yt-dlp или задайте YT_DLP_BIN", ytDlpBin())
 	}
@@ -457,7 +458,7 @@ func statusCmd(ctx context.Context, b *bot.Bot, update *models.Update) {
 		return
 	}
 	active := currentDownloads()
-	ytVer := ytDlpVersion(ctx)
+	ytVer := ytDlpVersion(ctx, 5*time.Second)
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text: fmt.Sprintf("Состояние:\nАктивных скачиваний: %d/%d\nyt-dlp: %s\nUptime: %s",
@@ -588,8 +589,8 @@ func successRate(dl, errs int64) int64 {
 	return (dl - errs) * 100 / dl
 }
 
-func ytDlpVersion(parent context.Context) string {
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+func ytDlpVersion(parent context.Context, timeout time.Duration) string {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, ytDlpBin(), "--version").Output()
 	if err != nil {
