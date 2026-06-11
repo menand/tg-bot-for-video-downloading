@@ -97,12 +97,9 @@ type downloadResult struct {
 }
 
 type videoInfo struct {
-	Title          string  `json:"title"`
-	Duration       float64 `json:"duration"`
-	Height         int     `json:"height"`
-	Width          int     `json:"width"`
-	Filesize       int64   `json:"filesize"`
-	FilesizeApprox int64   `json:"filesize_approx"`
+	Duration float64 `json:"duration"`
+	Height   int     `json:"height"`
+	Width    int     `json:"width"`
 }
 
 var downloadSem = make(chan struct{}, maxConcurrentDownloads)
@@ -746,7 +743,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	statusMsg, _ := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
-		Text:   "Получаю информацию о видео…",
+		Text:   "Начинаю скачивание…",
 	})
 	defer func() {
 		if statusMsg != nil {
@@ -799,7 +796,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	}
 
 	dlStart := time.Now()
-	result, err := downloadVideo(ctx, url, onPhase, onProgress)
+	result, err := downloadVideo(ctx, url, onProgress)
 	downloadDuration := time.Since(dlStart)
 
 	if errors.Is(err, context.Canceled) {
@@ -939,7 +936,6 @@ func getVideoDuration(parent context.Context, filePath string) time.Duration {
 }
 
 type progressFunc func(percent, downloaded, total, speed string)
-type phaseFunc func(text string)
 
 // lineWriter режет поток на строки и передаёт их в emit построчно
 type lineWriter struct {
@@ -1016,63 +1012,11 @@ func runYtDlpDownload(ctx context.Context, args []string, onProgress progressFun
 	return outputBuf.String(), err
 }
 
-func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProgress progressFunc) (*downloadResult, error) {
-	ytDlp := ytDlpBin()
+func downloadVideo(parent context.Context, url string, onProgress progressFunc) (*downloadResult, error) {
 	userAgent := ytDlpUserAgent()
 
 	ctx, cancel := context.WithTimeout(parent, downloadTimeout)
 	defer cancel()
-
-	log.Printf("[yt-dlp] получение информации: url=%s", url)
-
-	cmdInfo := exec.CommandContext(ctx, ytDlp,
-		"--no-playlist",
-		"--dump-json",
-		"--no-warnings",
-		"--",
-		url,
-	)
-	infoOutput, err := cmdInfo.CombinedOutput()
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		raw := strings.TrimSpace(string(infoOutput))
-		log.Printf("[yt-dlp] dump-json ошибка: url=%s err=%v вывод=%q",
-			url, err, truncateStr(raw, 500))
-		if msg := extractYtDlpError(raw); msg != "" {
-			return nil, &ytDlpUserError{msg: msg}
-		}
-		return nil, fmt.Errorf("не удалось получить информацию о видео: %v", err)
-	}
-
-	var vi videoInfo
-	if err := json.Unmarshal(infoOutput, &vi); err != nil {
-		log.Printf("[yt-dlp] парсинг JSON ошибка: url=%s err=%v", url, err)
-		vi.Title = ""
-		vi.Duration = 0
-	}
-
-	log.Printf("[yt-dlp] информация: url=%s title=%q duration=%.1fs", url, vi.Title, vi.Duration)
-
-	const maxBytes = int64(maxFileSizeMB) * 1024 * 1024
-	knownSize := vi.Filesize
-	if knownSize == 0 {
-		knownSize = vi.FilesizeApprox
-	}
-	if knownSize > maxBytes {
-		log.Printf("[yt-dlp] файл заведомо больше %dMB: url=%s filesize=%s", maxFileSizeMB, url, formatFileSize(knownSize))
-		return nil, errVideoTooLarge
-	}
-
-	var duration time.Duration
-	if vi.Duration > 0 {
-		duration = time.Duration(vi.Duration * float64(time.Second))
-	}
-
-	if onPhase != nil {
-		onPhase("Начинаю скачивание…")
-	}
 
 	formats := []string{
 		"best[ext=mp4]/best",
@@ -1106,6 +1050,7 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 			"-f", format,
 			"--merge-output-format", "mp4",
 			"--max-filesize", "50M",
+			"--write-info-json",
 			"-o", outPath,
 			"--no-warnings",
 			"--newline",
@@ -1118,7 +1063,8 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 
 		out, err := runYtDlpDownload(ctx, args, onProgress)
 		raw := strings.TrimSpace(out)
-		if msg := extractYtDlpError(raw); msg != "" {
+		msg := extractYtDlpError(raw)
+		if msg != "" {
 			lastYtMsg = msg
 		}
 		// при превышении --max-filesize yt-dlp пишет "File is larger than max-filesize" и выходит с кодом 0
@@ -1128,30 +1074,56 @@ func downloadVideo(parent context.Context, url string, onPhase phaseFunc, onProg
 		if err != nil {
 			log.Printf("[yt-dlp] попытка %d неудача: url=%s format=%s err=%v вывод=%q", i+1, url, format, err, truncateStr(raw, 500))
 			lastErr = err
+			// ошибка уровня видео (приватное, удалено, регион) — другие качества не помогут
+			if msg != "" && !strings.Contains(strings.ToLower(msg), "format") {
+				break
+			}
 			continue
 		}
 
 		entries, _ := os.ReadDir(dir)
 		hasPart := false
+		var videoPath, infoPath string
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
 			name := e.Name()
-			if strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".ytdl") {
+			switch {
+			case strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".ytdl"):
 				log.Printf("[yt-dlp] пропуск temp-файла: %s", name)
 				if strings.HasSuffix(name, ".part") {
 					hasPart = true
 				}
-				continue
+			case strings.HasSuffix(name, ".info.json"):
+				infoPath = filepath.Join(dir, name)
+			default:
+				if videoPath == "" {
+					videoPath = filepath.Join(dir, name)
+				}
+			}
+		}
+
+		if videoPath != "" {
+			var vi videoInfo
+			if infoPath != "" {
+				if data, rdErr := os.ReadFile(infoPath); rdErr == nil {
+					if jsonErr := json.Unmarshal(data, &vi); jsonErr != nil {
+						log.Printf("[yt-dlp] парсинг info.json: url=%s err=%v", url, jsonErr)
+					}
+				}
+			}
+			var duration time.Duration
+			if vi.Duration > 0 {
+				duration = time.Duration(vi.Duration * float64(time.Second))
 			}
 			var size int64
-			if fi, err := e.Info(); err == nil {
+			if fi, stErr := os.Stat(videoPath); stErr == nil {
 				size = fi.Size()
 			}
 			log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
-				i+1, url, format, name, formatFileSize(size))
-			return &downloadResult{filePath: filepath.Join(dir, name), duration: duration, width: vi.Width, height: vi.Height}, nil
+				i+1, url, format, filepath.Base(videoPath), formatFileSize(size))
+			return &downloadResult{filePath: videoPath, duration: duration, width: vi.Width, height: vi.Height}, nil
 		}
 
 		if hasPart {
