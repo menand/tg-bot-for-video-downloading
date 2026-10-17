@@ -609,7 +609,7 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 			log.Printf("[download] отклонён: бот останавливается (url=%s)", url)
 			return
 		}
-		go handleVideoURL(ctx, b, update.Message.Chat.ID, senderInfo(update), url)
+		go handleVideoURL(ctx, b, update.Message.Chat.ID, uid, senderInfo(update), url)
 		return
 	}
 
@@ -765,12 +765,19 @@ func downloadNotifyText(requester, url, filename string, size int64, duration ti
 		formatFileSize(size), formatDuration(duration))
 }
 
-// notifyAdminAboutDownload уведомляет владельца (ADMIN_CHAT_ID) о каждом скачанном файле
-func notifyAdminAboutDownload(ctx context.Context, b *bot.Bot, requester, url, filename string, size int64, duration time.Duration) {
-	if adminChatID == 0 {
+// downloadFailNotifyText формирует текст уведомления владельцу о неудачной попытке
+func downloadFailNotifyText(requester, url, reason string) string {
+	return fmt.Sprintf("⚠️ Не удалось скачать\n👤 %s\n🔗 %s\n❌ %s",
+		sanitizeNotifyText(requester), sanitizeNotifyText(url), sanitizeNotifyText(reason))
+}
+
+// notifyOwner уведомляет владельца (ADMIN_CHAT_ID) о скачиваниях других пользователей;
+// свои скачивания не уведомляем, без ADMIN_CHAT_ID молча выключено
+func notifyOwner(ctx context.Context, b *bot.Bot, uid int64, text string) {
+	if adminChatID == 0 || uid == adminChatID {
 		return
 	}
-	sendTextWithRetry(ctx, b, adminChatID, downloadNotifyText(requester, url, filename, size, duration))
+	sendTextWithRetry(ctx, b, adminChatID, text)
 }
 
 func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, caption string, result *downloadResult, duration time.Duration) error {
@@ -815,7 +822,7 @@ func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, caption string
 	return retryOnTransient(ctx, 2, asDocument)
 }
 
-func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, requester, url string) {
+func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, uid int64, requester, url string) {
 	defer downloadWG.Done()
 
 	if !acquireChatSlot(chatID) {
@@ -924,6 +931,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, requester, ur
 		}
 
 		sendTextWithRetry(ctx, b, chatID, userMsg)
+		notifyOwner(ctx, b, uid, downloadFailNotifyText(requester, url, userMsg))
 		return
 	}
 
@@ -933,6 +941,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, requester, ur
 	if err != nil {
 		log.Printf("[download] ошибка stat: url=%s err=%v", url, err)
 		sendTextWithRetry(ctx, b, chatID, "Не удалось получить информацию о файле.")
+		notifyOwner(ctx, b, uid, downloadFailNotifyText(requester, url, "внутренняя ошибка: файл не найден после скачивания"))
 		return
 	}
 
@@ -943,6 +952,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, requester, ur
 	if info.Size() > maxFileSizeMB*1024*1024 {
 		log.Printf("[download] файл слишком большой: url=%s size=%s", url, formatFileSize(info.Size()))
 		sendTextWithRetry(ctx, b, chatID, "Файл получился больше 50 МБ — Telegram не примет такой размер. Попробуй другую ссылку или качество.")
+		notifyOwner(ctx, b, uid, downloadFailNotifyText(requester, url, "файл получился больше 50 МБ"))
 		return
 	}
 
@@ -972,9 +982,10 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, requester, ur
 	if err != nil {
 		log.Printf("[send] отправка не удалась: url=%s err=%v", url, err)
 		sendTextWithRetry(ctx, b, chatID, "Скачал файл, но не получилось отправить.")
+		notifyOwner(ctx, b, uid, downloadFailNotifyText(requester, url, "скачал, но не удалось отправить файл"))
 	} else {
 		log.Printf("[send] успешно: url=%s size=%s", url, sizeStr)
-		notifyAdminAboutDownload(ctx, b, requester, url, filename, info.Size(), duration)
+		notifyOwner(ctx, b, uid, downloadNotifyText(requester, url, filename, info.Size(), duration))
 	}
 }
 

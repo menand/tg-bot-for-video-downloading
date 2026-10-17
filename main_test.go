@@ -149,6 +149,24 @@ func TestDownloadNotifyText(t *testing.T) {
 	}
 }
 
+func TestDownloadFailNotifyText(t *testing.T) {
+	text := downloadFailNotifyText(
+		"Пользователь: Имя - Иван Петров, id - 42, nick - @ivan",
+		"https://example.com/video",
+		"приватное видео",
+	)
+	for _, want := range []string{
+		"Не удалось скачать",
+		"Пользователь: Имя - Иван Петров, id - 42, nick - @ivan",
+		"https://example.com/video",
+		"приватное видео",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("downloadFailNotifyText: нет %q в %q", want, text)
+		}
+	}
+}
+
 func TestSanitizeNotifyText(t *testing.T) {
 	in := "обычный текст\u2028строка\u202E\u2066подмена\x00\u200F"
 	got := sanitizeNotifyText(in)
