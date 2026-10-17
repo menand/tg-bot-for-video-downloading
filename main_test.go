@@ -128,6 +128,40 @@ func TestFormatDuration(t *testing.T) {
 	}
 }
 
+func TestDownloadNotifyText(t *testing.T) {
+	text := downloadNotifyText(
+		"Пользователь: Имя - Иван Петров, id - 42, nick - @ivan",
+		"https://example.com/video",
+		"ролик.mp4",
+		5*1024*1024,
+		65*time.Second,
+	)
+	for _, want := range []string{
+		"Пользователь: Имя - Иван Петров, id - 42, nick - @ivan",
+		"https://example.com/video",
+		"ролик.mp4",
+		"5 MB",
+		"1:05",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("downloadNotifyText: нет %q в %q", want, text)
+		}
+	}
+}
+
+func TestSanitizeNotifyText(t *testing.T) {
+	in := "обычный текст\u2028строка\u202E\u2066подмена\x00\u200F"
+	got := sanitizeNotifyText(in)
+	for _, bad := range []rune{'\u2028', '\u2029', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069', '\x00', '\u200E', '\u200F'} {
+		if strings.ContainsRune(got, bad) {
+			t.Errorf("sanitizeNotifyText: символ %U остался в %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "обычный текст") {
+		t.Errorf("sanitizeNotifyText: обычный текст испорчен: %q", got)
+	}
+}
+
 func TestSuccessRate(t *testing.T) {
 	cases := []struct {
 		dl, errs, want int64

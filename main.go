@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-telegram/bot"
@@ -351,7 +352,7 @@ func main() {
 			log.Printf("Белый список пользователей: %d ID", len(allowedUserIDs))
 		}
 	} else {
-		log.Printf("ВНИМАНИЕ: ALLOWED_USER_IDS не задан — скачивание доступно ЛЮБОМУ пользователю")
+		log.Printf("ALLOWED_USER_IDS не задан — скачивание открыто для всех пользователей")
 	}
 
 	// PyInstaller-бинарь yt-dlp при холодном старте на слабом VPS распаковывается десятки секунд
@@ -608,7 +609,7 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 			log.Printf("[download] отклонён: бот останавливается (url=%s)", url)
 			return
 		}
-		go handleVideoURL(ctx, b, update.Message.Chat.ID, url)
+		go handleVideoURL(ctx, b, update.Message.Chat.ID, senderInfo(update), url)
 		return
 	}
 
@@ -739,6 +740,39 @@ func sendTextWithRetry(ctx context.Context, b *bot.Bot, chatID int64, text strin
 	}
 }
 
+// sanitizeNotifyText убирает управляющие символы и невидимые разделители/bidi-метки,
+// чтобы пользовательские данные (URL, имя) не подделывали вид уведомления в чате админа
+func sanitizeNotifyText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r):
+			return '_'
+		case r == '\u2028' || r == '\u2029' || r == '\u200E' || r == '\u200F':
+			return '_'
+		case r >= '\u202A' && r <= '\u202E':
+			return '_'
+		case r >= '\u2066' && r <= '\u2069':
+			return '_'
+		}
+		return r
+	}, s)
+}
+
+// downloadNotifyText формирует текст уведомления владельцу о скачанном файле
+func downloadNotifyText(requester, url, filename string, size int64, duration time.Duration) string {
+	return fmt.Sprintf("📥 Новое скачивание\n👤 %s\n🔗 %s\n📹 %s — %s, %s",
+		sanitizeNotifyText(requester), sanitizeNotifyText(url), sanitizeNotifyText(filename),
+		formatFileSize(size), formatDuration(duration))
+}
+
+// notifyAdminAboutDownload уведомляет владельца (ADMIN_CHAT_ID) о каждом скачанном файле
+func notifyAdminAboutDownload(ctx context.Context, b *bot.Bot, requester, url, filename string, size int64, duration time.Duration) {
+	if adminChatID == 0 {
+		return
+	}
+	sendTextWithRetry(ctx, b, adminChatID, downloadNotifyText(requester, url, filename, size, duration))
+}
+
 func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, caption string, result *downloadResult, duration time.Duration) error {
 	filename := filepath.Base(result.filePath)
 
@@ -781,7 +815,7 @@ func sendVideoFile(ctx context.Context, b *bot.Bot, chatID int64, caption string
 	return retryOnTransient(ctx, 2, asDocument)
 }
 
-func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
+func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, requester, url string) {
 	defer downloadWG.Done()
 
 	if !acquireChatSlot(chatID) {
@@ -940,6 +974,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 		sendTextWithRetry(ctx, b, chatID, "Скачал файл, но не получилось отправить.")
 	} else {
 		log.Printf("[send] успешно: url=%s size=%s", url, sizeStr)
+		notifyAdminAboutDownload(ctx, b, requester, url, filename, info.Size(), duration)
 	}
 }
 
