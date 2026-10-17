@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -47,6 +48,11 @@ var (
 	statsErrors   int64
 
 	downloadWG sync.WaitGroup
+
+	// флаг остановки: запрещает старт новых скачиваний между возвратом
+	// b.Start и downloadWG.Wait (иначе WaitGroup.Add может пройти после начала Wait)
+	downloadsStoppingMu sync.Mutex
+	downloadsStopping   bool
 
 	perChatMu     sync.Mutex
 	perChatActive = map[int64]struct{}{}
@@ -103,6 +109,11 @@ type videoInfo struct {
 }
 
 var downloadSem = make(chan struct{}, maxConcurrentDownloads)
+
+// отправки видеофайлов сериализованы: библиотека (v1.27) буферизует multipart в памяти
+// (пик ~3x размера файла), три параллельных отправки по 50 МБ ≈ 420 МБ heap —
+// для VPS с 2 ГБ RAM это OOM
+var sendSem = make(chan struct{}, 1)
 
 var errVideoTooLarge = errors.New("видео превышает 50 MB")
 
@@ -264,6 +275,25 @@ func releaseChatSlot(chatID int64) {
 	perChatMu.Unlock()
 }
 
+// startDownloadTracked регистрирует скачивание в downloadWG; после начала
+// остановки бота новые скачивания не принимаются
+func startDownloadTracked() bool {
+	downloadsStoppingMu.Lock()
+	defer downloadsStoppingMu.Unlock()
+	if downloadsStopping {
+		return false
+	}
+	downloadWG.Add(1)
+	return true
+}
+
+// stopAcceptingDownloads закрывает приём новых скачиваний перед ожиданием downloadWG
+func stopAcceptingDownloads() {
+	downloadsStoppingMu.Lock()
+	downloadsStopping = true
+	downloadsStoppingMu.Unlock()
+}
+
 // убирает tg-video-* директории, оставшиеся после аварийного завершения
 func cleanupOrphanTempDirs() {
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "tg-video-*"))
@@ -320,6 +350,8 @@ func main() {
 		} else {
 			log.Printf("Белый список пользователей: %d ID", len(allowedUserIDs))
 		}
+	} else {
+		log.Printf("ВНИМАНИЕ: ALLOWED_USER_IDS не задан — скачивание доступно ЛЮБОМУ пользователю")
 	}
 
 	// PyInstaller-бинарь yt-dlp при холодном старте на слабом VPS распаковывается десятки секунд
@@ -335,6 +367,10 @@ func main() {
 	opts := []bot.Option{
 		bot.WithDefaultHandler(defaultHandler),
 		bot.WithWorkers(10),
+		// Дефолтный HTTP-клиент библиотеки имеет таймаут 1 минута — аплоад 50 МБ
+		// на слабом канале VPS в него не укладывается. pollTimeout оставляем
+		// дефолтным (long-poll getUpdates ~59с), клиенту даём запас на отправку.
+		bot.WithHTTPClient(time.Minute, &http.Client{Timeout: 5 * time.Minute}),
 	}
 
 	if os.Getenv("BOT_DEBUG") == "1" {
@@ -370,6 +406,7 @@ func main() {
 
 	b.Start(ctx)
 
+	stopAcceptingDownloads()
 	log.Println("Ожидание завершения активных скачиваний…")
 	done := make(chan struct{})
 	go func() {
@@ -567,7 +604,10 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		}
 		log.Printf("—————————")
 		log.Printf("[url] %s запросил скачивание: %s", senderInfo(update), url)
-		downloadWG.Add(1)
+		if !startDownloadTracked() {
+			log.Printf("[download] отклонён: бот останавливается (url=%s)", url)
+			return
+		}
 		go handleVideoURL(ctx, b, update.Message.Chat.ID, url)
 		return
 	}
@@ -652,6 +692,27 @@ func retryOnTransient(ctx context.Context, attempts int, fn func() error) error 
 			return nil
 		}
 		lastErr = err
+
+		// flood-wait от Telegram: ждём столько, сколько просят, вместо фиксированной паузы
+		var tmr *bot.TooManyRequestsError
+		if errors.As(err, &tmr) {
+			// не спим после последней попытки и не зависаем на огромных RetryAfter
+			if i+1 == attempts || tmr.RetryAfter > 60 {
+				return err
+			}
+			wait := time.Duration(tmr.RetryAfter) * time.Second
+			if wait <= 0 {
+				wait = time.Duration(i+1) * time.Second
+			}
+			log.Printf("[retry] %d/%d: flood wait %s", i+1, attempts, wait)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+
 		if !isTransientErr(err) {
 			return err
 		}
@@ -741,10 +802,16 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 
 	log.Printf("[download] начало: url=%s", url)
 
-	statusMsg, _ := b.SendMessage(ctx, &bot.SendMessageParams{
+	statusMsg, statusErr := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
 		Text:   "Начинаю скачивание…",
 	})
+	if statusErr != nil {
+		// библиотека возвращает non-nil Message даже при ошибке — обнуляем,
+		// иначе EditMessageText/DeleteMessage будут бить в message_id=0
+		log.Printf("[download] статус-сообщение не отправлено: %v", statusErr)
+		statusMsg = nil
+	}
 	defer func() {
 		if statusMsg != nil {
 			b.DeleteMessage(ctx, &bot.DeleteMessageParams{
@@ -865,7 +932,10 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, url string) {
 	caption = truncateUTF8(caption, maxCaptionLen)
 
 	onPhase("Отправляю видео…")
-	if err := sendVideoFile(ctx, b, chatID, caption, result, duration); err != nil {
+	sendSem <- struct{}{}
+	err = sendVideoFile(ctx, b, chatID, caption, result, duration)
+	<-sendSem
+	if err != nil {
 		log.Printf("[send] отправка не удалась: url=%s err=%v", url, err)
 		sendTextWithRetry(ctx, b, chatID, "Скачал файл, но не получилось отправить.")
 	} else {
@@ -1027,7 +1097,8 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 
 	var lastErr error
 	var lastYtMsg string
-	var sawTooLarge bool
+	var sawTooLarge bool  // хотя бы одна попытка упёрлась в лимит размера
+	var lastTooLarge bool // последняя попытка упёрлась в лимит размера
 	var dir string
 	for i, format := range formats {
 		if ctx.Err() != nil {
@@ -1068,12 +1139,14 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			lastYtMsg = msg
 		}
 		// при превышении --max-filesize yt-dlp пишет "File is larger than max-filesize" и выходит с кодом 0
-		if err == nil && strings.Contains(raw, "larger than max-filesize") {
+		thisTooLarge := strings.Contains(raw, "larger than max-filesize")
+		if thisTooLarge {
 			sawTooLarge = true
 		}
 		if err != nil {
 			log.Printf("[yt-dlp] попытка %d неудача: url=%s format=%s err=%v вывод=%q", i+1, url, format, err, truncateStr(raw, 500))
 			lastErr = err
+			lastTooLarge = thisTooLarge
 			// ошибка уровня видео (приватное, удалено, регион) — другие качества не помогут
 			if msg != "" && !strings.Contains(strings.ToLower(msg), "format") {
 				break
@@ -1121,14 +1194,25 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			if fi, stErr := os.Stat(videoPath); stErr == nil {
 				size = fi.Size()
 			}
+			// размер проверяем до отправки: для видео без Content-Length
+			// --max-filesize не срабатывает, и без этой проверки качество ниже не попробуется
+			if size > maxFileSizeMB*1024*1024 {
+				log.Printf("[yt-dlp] попытка %d: файл больше %d МБ (%s) — пробую качество ниже",
+					i+1, maxFileSizeMB, formatFileSize(size))
+				sawTooLarge = true
+				lastTooLarge = true
+				continue
+			}
 			log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
 				i+1, url, format, filepath.Base(videoPath), formatFileSize(size))
 			return &downloadResult{filePath: videoPath, duration: duration, width: vi.Width, height: vi.Height}, nil
 		}
 
 		if hasPart {
+			thisTooLarge = true
 			sawTooLarge = true
 		}
+		lastTooLarge = thisTooLarge
 		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
 	}
 
@@ -1138,7 +1222,11 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if sawTooLarge {
+	// «слишком большое» отдаём, если последняя попытка упёрлась в размер, либо
+	// если size-abort был в других попытках, а последняя ошибка — про формат
+	// (типично: единственный формат видео больше 50 МБ). Иначе важнее реальная
+	// ошибка последней попытки (например, login required).
+	if lastTooLarge || (sawTooLarge && (lastYtMsg == "" || strings.Contains(strings.ToLower(lastYtMsg), "format"))) {
 		return nil, errVideoTooLarge
 	}
 	if lastYtMsg != "" {

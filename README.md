@@ -89,6 +89,10 @@ go build -o telegram-bot
 ```bash
 git clone <url> telegram-bot && cd telegram-bot
 
+# Каталог данных должен принадлежать uid 1000 (botuser в контейнере):
+# bind-mount не наследует владельца из образа, иначе бот уйдёт в crash-loop
+mkdir -p data && chown -R 1000:1000 data
+
 # Создай .env с токеном и admin ID
 echo 'TELEGRAM_BOT_TOKEN=твой_токен
 ADMIN_CHAT_ID=123456789' > .env
@@ -109,4 +113,4 @@ docker compose down
 git pull && docker compose down && docker-compose up -d --build
 ```
 
-Версия yt-dlp пиннится в Dockerfile (`YT_DLP_VERSION`, pip-формат вида `2026.6.9`), обновляй вручную.
+Версия yt-dlp пиннится в Dockerfile (`YT_DLP_VERSION`, pip-формат вида `2026.8.19`), обновляй вручную (релизы у yt-dlp выходят нерегулярно).
