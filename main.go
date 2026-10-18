@@ -37,6 +37,9 @@ const (
 	maxConcurrentDownloads = 3
 	maxLogSize             = 5 * 1024 * 1024
 	maxYtDlpOutput         = 256 * 1024
+	// качать фрагменты в несколько потоков: VK режет скорость одной связи —
+	// замер на VK: ~1.5 МБ/с, с 8 потоками ~3.4 МБ/с
+	maxConcurrentFragments = 8
 	settingsPath           = "/data/bot-settings.json"
 )
 
@@ -1340,6 +1343,7 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			"-S", sortKey,
 			"--merge-output-format", "mp4",
 			"--max-filesize", "50M",
+			"--concurrent-fragments", strconv.Itoa(maxConcurrentFragments),
 			"--write-info-json",
 			"-o", outPath,
 			"--no-warnings",
