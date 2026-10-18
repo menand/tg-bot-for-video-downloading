@@ -291,3 +291,23 @@ func TestRotatingLogRotation(t *testing.T) {
 		t.Error("запись после ротации должна добавляться в конец файла")
 	}
 }
+
+func TestStreamFileRe(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"Видео с котиком.mp4", false},
+		{"Video by korolyuknatalia_68.mp4", false},
+		{"Foo.f123.bar.mp4", false},              // маркер не перед самим расширением — это часть заголовка
+		{"Movie.final.mp4", false},               // в маркере нужна цифра — иначе это обычный заголовок
+		{"Title.f136.mp4", true},                 // промежуточный поток видео
+		{"Title.f140.m4a", true},                 // промежуточный поток аудио
+		{"ns.fdash-1039454408717152v.mp4", true}, // Instagram: id формата dash-…
+	}
+	for _, c := range cases {
+		if got := streamFileRe.MatchString(c.name); got != c.want {
+			t.Errorf("streamFileRe.MatchString(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

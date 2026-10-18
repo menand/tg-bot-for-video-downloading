@@ -6,13 +6,13 @@
 
 - Go 1.26+
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — для скачивания видео (установи отдельно)
-- **ffmpeg/ffprobe** (опционально) — для определения длительности видео; бот работает и без них
+- **ffmpeg** — обязателен для YouTube и других сайтов с раздельными видео- и аудиопотоками: бот склеивает их в mp4. **ffprobe** (опционально) — для определения длительности видео
 - Токен бота от [@BotFather](https://t.me/BotFather) в Telegram
 
 ### Установка yt-dlp
 
-- **macOS:** `brew install yt-dlp`
-- **Linux:** скачай бинарник с [релиза](https://github.com/yt-dlp/yt-dlp/releases) или `pip install yt-dlp`
+- **macOS:** `brew install yt-dlp` (для YouTube также поставь `deno` — без JS-runtime yt-dlp не решает YouTube-челленджи)
+- **Linux:** скачай бинарник с [релиза](https://github.com/yt-dlp/yt-dlp/releases) или `pip install 'yt-dlp[default]'` (extras ставят yt-dlp-ejs, нужный для YouTube)
 - Кастомный путь: установи переменную `YT_DLP_BIN`
 
 ## Как получить токен
@@ -75,7 +75,7 @@ TELEGRAM_BOT_TOKEN="твой_токен" ADMIN_CHAT_ID="123456789" go run main.g
 - Файлы больше 50 МБ Telegram не принимает — бот откажет
 - До 3 одновременных скачиваний, остальные — «попробуй позже»
 - Таймаут скачивания — 10 минут
-- Качество: лучший MP4 до 50 МБ
+- Качество: бот сам подбирает (обычно до 720p), при необходимости склеивает видео со звуком, чтобы файл влез в лимит Telegram
 
 ## Сборка
 

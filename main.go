@@ -39,7 +39,11 @@ const (
 )
 
 var (
-	urlRegex     = regexp.MustCompile(`https?://[^\s]+`)
+	urlRegex = regexp.MustCompile(`https?://[^\s]+`)
+	// промежуточный файл потока при склейке: yt-dlp вставляет id формата
+	// перед расширением (Title.f136.mp4, Title.fdash-…v.mp4); у готового
+	// результата (Title.mp4) такого маркера нет
+	streamFileRe = regexp.MustCompile(`\.f[^.]*\d[^.]*\.\w+$`)
 	startTime    time.Time
 	adminChatID  int64
 	shutdownFunc context.CancelFunc
@@ -1134,11 +1138,22 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 	ctx, cancel := context.WithTimeout(parent, downloadTimeout)
 	defer cancel()
 
-	formats := []string{
-		"best[ext=mp4]/best",
-		"best[ext=mp4][height<=720]/best[height<=720]",
-		"best[ext=mp4][height<=480]/best[height<=480]",
-		"best[ext=mp4][height<=360]/best[height<=360]",
+	// Один ринг лестницы = один запуск yt-dlp. Селектор, по порядку:
+	//  1) склейка avc1-видео со звуком через ffmpeg — так качаются ролики
+	//     с раздельными потоками (шортсы и большинство YouTube-видео: даже
+	//     если у ролика есть готовый muxed-файл, это обычно только 360p);
+	//  2) готовый muxed-файл mp4 (Instagram и т.п. — там склейки нет,
+	//     остаётся проверенный h264-в-mp4), затем любой muxed-контейнер;
+	//  3) последний резерв — склейка потоков любого кодека.
+	// Сортировка -S: res:N понижает качество при превышении лимита Telegram
+	// (учитывает вертикальные видео — шортсы), codec:avc:m4a предпочитает
+	// самый совместимый с Telegram кодек h264+aac.
+	const formatSelector = "bv[vcodec^=avc1]+ba/best[ext=mp4]/best/bv+ba"
+	sortKeys := []string{
+		"res:720,codec:avc:m4a",
+		"res:480,codec:avc:m4a",
+		"res:360,codec:avc:m4a",
+		"res:240,codec:avc:m4a",
 	}
 
 	var lastErr error
@@ -1146,7 +1161,7 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 	var sawTooLarge bool  // хотя бы одна попытка упёрлась в лимит размера
 	var lastTooLarge bool // последняя попытка упёрлась в лимит размера
 	var dir string
-	for i, format := range formats {
+	for i, sortKey := range sortKeys {
 		if ctx.Err() != nil {
 			break
 		}
@@ -1160,11 +1175,12 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 		}
 		outPath := filepath.Join(dir, "%(title).100s.%(ext)s")
 
-		log.Printf("[yt-dlp] попытка %d/%d: url=%s format=%s", i+1, len(formats), url, format)
+		log.Printf("[yt-dlp] попытка %d/%d: url=%s sort=%s", i+1, len(sortKeys), url, sortKey)
 
 		args := []string{
 			"--no-playlist",
-			"-f", format,
+			"-f", formatSelector,
+			"-S", sortKey,
 			"--merge-output-format", "mp4",
 			"--max-filesize", "50M",
 			"--write-info-json",
@@ -1190,11 +1206,13 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			sawTooLarge = true
 		}
 		if err != nil {
-			log.Printf("[yt-dlp] попытка %d неудача: url=%s format=%s err=%v вывод=%q", i+1, url, format, err, truncateStr(raw, 500))
+			log.Printf("[yt-dlp] попытка %d неудача: url=%s sort=%s err=%v вывод=%q", i+1, url, sortKey, err, truncateStr(raw, 500))
 			lastErr = err
 			lastTooLarge = thisTooLarge
-			// ошибка уровня видео (приватное, удалено, регион) — другие качества не помогут
-			if msg != "" && !strings.Contains(strings.ToLower(msg), "format") {
+			// ошибка уровня видео (приватное, удалено, регион) — другие качества не помогут;
+			// ошибки постпроцессинга (склейка) не фатальны — низкие ринги могут сработать
+			lowerMsg := strings.ToLower(msg)
+			if msg != "" && !strings.Contains(lowerMsg, "format") && !strings.Contains(lowerMsg, "postprocessing") {
 				break
 			}
 			continue
@@ -1216,6 +1234,11 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 				}
 			case strings.HasSuffix(name, ".info.json"):
 				infoPath = filepath.Join(dir, name)
+			case streamFileRe.MatchString(name):
+				// при обрыве видео по лимиту yt-dlp выходит с кодом 0 и
+				// оставляет докачанное аудио отдельным потоком — принять
+				// его за результат нельзя
+				log.Printf("[yt-dlp] пропуск файла потока: %s", name)
 			default:
 				if videoPath == "" {
 					videoPath = filepath.Join(dir, name)
@@ -1223,7 +1246,10 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			}
 		}
 
-		if videoPath != "" {
+		// готовый файл принимаем, только если рядом не осталось .part:
+		// при обрыве по лимиту yt-dlp выходит с кодом 0 и оставляет
+		// докачанный аудиофайл, который иначе уйдёт пользователю как «видео»
+		if videoPath != "" && !hasPart {
 			var vi videoInfo
 			if infoPath != "" {
 				if data, rdErr := os.ReadFile(infoPath); rdErr == nil {
@@ -1249,8 +1275,8 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 				lastTooLarge = true
 				continue
 			}
-			log.Printf("[yt-dlp] попытка %d успех: url=%s format=%s file=%s size=%s",
-				i+1, url, format, filepath.Base(videoPath), formatFileSize(size))
+			log.Printf("[yt-dlp] попытка %d успех: url=%s sort=%s file=%s size=%s",
+				i+1, url, sortKey, filepath.Base(videoPath), formatFileSize(size))
 			return &downloadResult{filePath: videoPath, duration: duration, width: vi.Width, height: vi.Height}, nil
 		}
 
@@ -1259,7 +1285,7 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			sawTooLarge = true
 		}
 		lastTooLarge = thisTooLarge
-		log.Printf("[yt-dlp] попытка %d: файл не найден в dir (url=%s)", i+1, url)
+		log.Printf("[yt-dlp] попытка %d: пригодного файла нет (url=%s, part=%v)", i+1, url, hasPart)
 	}
 
 	if dir != "" {
