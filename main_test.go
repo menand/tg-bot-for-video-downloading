@@ -311,3 +311,77 @@ func TestStreamFileRe(t *testing.T) {
 		}
 	}
 }
+
+func TestFindSourceURL(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"vk: embedUrl в JSON страницы",
+			`{"player":{"embedUrl":"https://vkvideo.ru/video_ext.php?autoplay=1&hash=235ad9a4ddaf1bec&id=456355914&loop=0&oid=-223170978","videoUrl":"http://vk.com/video-223170978_456355914"}}`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"vk: HTML-энтити и обратный порядок параметров",
+			`<iframe src="//vkvideo.ru/video_ext.php?oid=-223170978&amp;hash=235ad9a4ddaf1bec&amp;id=456355914"></iframe>`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"vk: percent-кодированный src вложенного iframe",
+			`<iframe src="//yastatic.net/video-player/pages-common/vk/vk.html#html=%3Ciframe%20src%3D%22https%3A%2F%2Fvkvideo.ru%2Fvideo_ext.php%3Fautoplay%3D1%26hash%3D235ad9a4ddaf1bec%26id%3D456355914%26loop%3D0%26oid%3D-223170978%22%3E"></iframe>`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"vk: битый percent в CSS не мешает раскодировать ссылку",
+			`<style>.p{width:100%;}</style><iframe src="//yastatic.net/vk/vk.html#html=%3Ciframe%20src%3D%22https%3A%2F%2Fvkvideo.ru%2Fvideo_ext.php%3Fautoplay%3D1%26hash%3D235ad9a4ddaf1bec%26id%3D456355914%26loop%3D0%26oid%3D-223170978%22%3E"></iframe>`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"vk: vk.com video_ext.php без прямой ссылки",
+			`<iframe src="https://vk.com/video_ext.php?oid=-223170978&amp;id=456355914&amp;hash=abc"></iframe>`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"vk: невалидный video_ext.php не блокирует следующий",
+			`<a href="https://vkvideo.ru/video_ext.php?foo=1">a</a><a href="https://vkvideo.ru/video_ext.php?oid=-223170978&id=456355914">b</a>`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"vk: прямая ссылка в счётчиках",
+			`{"counters":{"duration":503},"videoUrl":"http://vk.com/video-223170978_456355914"}`,
+			"https://vkvideo.ru/video-223170978_456355914",
+		},
+		{
+			"rutube",
+			`<iframe src="https://rutube.ru/video/97be0239be50dea37db4b9411b494474/?r=a"></iframe>`,
+			"https://rutube.ru/video/97be0239be50dea37db4b9411b494474/",
+		},
+		{
+			"dzen",
+			`<a href="https://dzen.ru/video/watch/60f1b2c3d4e5f6a7b8c9d0e1">`,
+			"https://dzen.ru/video/watch/60f1b2c3d4e5f6a7b8c9d0e1",
+		},
+		{
+			"ok.ru",
+			`<iframe src="https://ok.ru/video/1234567890123">`,
+			"https://ok.ru/video/1234567890123",
+		},
+		{
+			"youtube embed",
+			`<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1">`,
+			"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		},
+		{
+			"источника нет",
+			`<html><body>просто текст без плееров</body></html>`,
+			"",
+		},
+	}
+	for _, c := range cases {
+		if got := findSourceURL(c.body); got != c.want {
+			t.Errorf("%s: findSourceURL() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}

@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,10 +46,13 @@ var (
 	// перед расширением (Title.f136.mp4, Title.fdash-…v.mp4); у готового
 	// результата (Title.mp4) такого маркера нет
 	streamFileRe = regexp.MustCompile(`\.f[^.]*\d[^.]*\.\w+$`)
-	startTime    time.Time
-	adminChatID  int64
-	shutdownFunc context.CancelFunc
-	logPath      = "/data/bot.log"
+	// страница-агрегатор Яндекс.Видео: сам yt-dlp её не разбирает (его
+	// экстрактор отстал от вёрстки) — источник достаём со страницы сами
+	yandexVideoRe = regexp.MustCompile(`^https?://(?:www\.)?yandex\.\w{2,3}(?:\.(?:am|ge|il|tr))?/video/(?:touch/)?(?:preview|watch)`)
+	startTime     time.Time
+	adminChatID   int64
+	shutdownFunc  context.CancelFunc
+	logPath       = "/data/bot.log"
 
 	statsAttempts int64
 	statsErrors   int64
@@ -1132,11 +1137,163 @@ func runYtDlpDownload(ctx context.Context, args []string, onProgress progressFun
 	return outputBuf.String(), err
 }
 
+// sourcePatterns — известные встраиваемые плееры страниц-агрегаторов:
+// первое совпадение выигрывает, от точных «плеерных» якорей к запасным
+var sourcePatterns = []struct {
+	re    *regexp.Regexp
+	build func(m []string) string
+}{
+	{
+		// VK Видео: параметры embed-плеера video_ext.php в любом порядке
+		regexp.MustCompile(`vk(?:video)?\.(?:ru|com)/video_ext\.php\?([^"'\s<\\]+)`),
+		func(m []string) string {
+			vals, _ := url.ParseQuery(strings.ReplaceAll(m[1], "&amp;", "&"))
+			oid, id := vals.Get("oid"), vals.Get("id")
+			if oid == "" || id == "" {
+				return ""
+			}
+			return "https://vkvideo.ru/video" + oid + "_" + id
+		},
+	},
+	{
+		regexp.MustCompile(`vk(?:video)?\.(?:ru|com)/video(-?\d+)_(\d+)`),
+		func(m []string) string { return "https://vkvideo.ru/video" + m[1] + "_" + m[2] },
+	},
+	{
+		regexp.MustCompile(`rutube\.ru/video/([0-9a-f]{32})`),
+		func(m []string) string { return "https://rutube.ru/video/" + m[1] + "/" },
+	},
+	{
+		regexp.MustCompile(`(?:dzen\.ru|zen\.yandex\.ru)/video/watch/([A-Za-z0-9_-]+)`),
+		func(m []string) string { return "https://dzen.ru/video/watch/" + m[1] },
+	},
+	{
+		regexp.MustCompile(`ok\.ru/video/(\d+)`),
+		func(m []string) string { return "https://ok.ru/video/" + m[1] },
+	},
+	{
+		regexp.MustCompile(`(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([\w-]{11})`),
+		func(m []string) string { return "https://www.youtube.com/watch?v=" + m[1] },
+	},
+}
+
+// findSourceURL ищет на странице-агрегаторе прямую ссылку на источник видео.
+// Сканируются варианты текста страницы: сырой HTML и с раскрытыми HTML-энтити
+// и percent-кодировкой (в src iframe вложенная ссылка закодирована).
+func findSourceURL(body string) string {
+	unescaped := html.UnescapeString(body)
+	variants := make([]string, 0, 4)
+	addVariant := func(v string) {
+		for _, x := range variants {
+			if x == v {
+				return
+			}
+		}
+		variants = append(variants, v)
+	}
+	addVariant(body)
+	addVariant(unescaped)
+	addVariant(unescapePercent(body))
+	addVariant(unescapePercent(unescaped))
+
+	for _, p := range sourcePatterns {
+		for _, text := range variants {
+			for _, m := range p.re.FindAllStringSubmatch(text, -1) {
+				if src := p.build(m); src != "" {
+					return src
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// unescapePercent мягко раскодирует percent-последовательности (%XX):
+// невалидные вхождения («100%», «%zz») остаются как есть — url.PathUnescape
+// спотыкается о любую «%» в CSS/JS страницы и отказывается целиком
+func unescapePercent(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if hi, ok := unhexByte(s[i+1]); ok {
+				if lo, ok := unhexByte(s[i+2]); ok {
+					b.WriteByte(hi<<4 | lo)
+					i += 2
+					continue
+				}
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func unhexByte(c byte) (byte, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0', true
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10, true
+	case 'A' <= c && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// resolveVideoSource заменяет страницы-агрегаторы (Яндекс.Видео) на прямую
+// ссылку источника; остальные ссылки не трогает.
+func resolveVideoSource(ctx context.Context, pageURL string) string {
+	if !yandexVideoRe.MatchString(pageURL) {
+		return pageURL
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		log.Printf("[source] некорректная ссылка: url=%s err=%v", pageURL, err)
+		return pageURL
+	}
+	req.Header.Set("User-Agent", ytDlpUserAgent())
+	req.Header.Set("Accept-Language", "ru,en;q=0.9")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[source] страница не открылась: url=%s err=%v", pageURL, err)
+		return pageURL
+	}
+	defer resp.Body.Close()
+	const maxPageSize = 2 * 1024 * 1024
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPageSize+1))
+	if err != nil {
+		log.Printf("[source] не удалось прочитать страницу: url=%s err=%v", pageURL, err)
+		return pageURL
+	}
+	if len(body) > maxPageSize {
+		// обрезаем по последней кавычке, чтобы не поймать половину ссылки на границе
+		cut := bytes.LastIndexByte(body[:maxPageSize], '"')
+		if cut < 0 {
+			cut = maxPageSize - 1
+		}
+		body = body[:cut+1]
+		log.Printf("[source] страница больше %d КБ — читаю начало: url=%s", maxPageSize/1024, pageURL)
+	}
+	src := findSourceURL(string(body))
+	if src == "" {
+		log.Printf("[source] источник на странице не найден: url=%s", pageURL)
+		return pageURL
+	}
+	log.Printf("[source] источник: url=%s → %s", pageURL, src)
+	return src
+}
+
 func downloadVideo(parent context.Context, url string, onProgress progressFunc) (*downloadResult, error) {
 	userAgent := ytDlpUserAgent()
 
 	ctx, cancel := context.WithTimeout(parent, downloadTimeout)
 	defer cancel()
+
+	// страницы-агрегаторы (Яндекс.Видео) заменяем на прямую ссылку источника
+	url = resolveVideoSource(ctx, url)
 
 	// Один ринг лестницы = один запуск yt-dlp. Селектор, по порядку:
 	//  1) склейка avc1-видео со звуком через ffmpeg — так качаются ролики
