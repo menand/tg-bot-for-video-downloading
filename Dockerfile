@@ -16,7 +16,7 @@ RUN apk add --no-cache ca-certificates ffmpeg python3 py3-pip deno
 # Формат версии у pip — 2026.8.19 (без ведущих нулей), а не тег релиза 2026.08.19.
 # [default] обязателен: тянет yt-dlp-ejs (challenge solver скрипты) — без него
 # YouTube отдаёт "Signature solving failed" даже при наличии deno.
-ARG YT_DLP_VERSION=2026.8.19
+ARG YT_DLP_VERSION=2026.10.21
 RUN pip install --no-cache-dir --break-system-packages "yt-dlp[default]==${YT_DLP_VERSION}" && \
     yt-dlp --version
 
