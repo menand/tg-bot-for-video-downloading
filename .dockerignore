@@ -3,6 +3,7 @@
 .gitignore
 .env
 .env.*
+data/
 !.env.example
 *.md
 Dockerfile

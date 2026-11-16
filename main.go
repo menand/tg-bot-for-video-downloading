@@ -44,7 +44,8 @@ const (
 )
 
 var (
-	urlRegex = regexp.MustCompile(`https?://[^\s]+`)
+	urlRegex          = regexp.MustCompile(`https?://[^\s]+`)
+	instagramPostPath = regexp.MustCompile(`^/(p|reel|tv)/[A-Za-z0-9_-]+/?$`)
 	// промежуточный файл потока при склейке: yt-dlp вставляет id формата
 	// перед расширением (Title.f136.mp4, Title.fdash-…v.mp4); у готового
 	// результата (Title.mp4) такого маркера нет
@@ -916,7 +917,7 @@ func handleVideoURL(ctx context.Context, b *bot.Bot, chatID int64, uid int64, re
 	}
 
 	dlStart := time.Now()
-	result, err := downloadVideo(ctx, url, onProgress)
+	result, err := downloadVideo(ctx, url, onProgress, isAdmin(uid) && chatID == uid)
 	downloadDuration := time.Since(dlStart)
 
 	if errors.Is(err, context.Canceled) {
@@ -1289,14 +1290,61 @@ func resolveVideoSource(ctx context.Context, pageURL string) string {
 	return src
 }
 
-func downloadVideo(parent context.Context, url string, onProgress progressFunc) (*downloadResult, error) {
-	userAgent := ytDlpUserAgent()
-
+func downloadVideo(parent context.Context, rawURL string, onProgress progressFunc, allowInstagramLogin bool) (*downloadResult, error) {
 	ctx, cancel := context.WithTimeout(parent, downloadTimeout)
 	defer cancel()
 
 	// страницы-агрегаторы (Яндекс.Видео) заменяем на прямую ссылку источника
-	url = resolveVideoSource(ctx, url)
+	source := resolveVideoSource(ctx, rawURL)
+	result, err := downloadVideoFormats(ctx, source, onProgress, "")
+	cookiesPath := os.Getenv("INSTAGRAM_COOKIES_FILE")
+	var ytErr *ytDlpUserError
+	if !allowInstagramLogin || cookiesPath == "" || !errors.As(err, &ytErr) || ctx.Err() != nil {
+		return result, err
+	}
+	retryURL := instagramLoginRetryURL(rawURL, ytErr.msg)
+	if retryURL == "" {
+		return result, err
+	}
+
+	// yt-dlp может перезаписать cookie-файл. Каждой загрузке даём отдельную копию.
+	cookies, readErr := os.ReadFile(cookiesPath)
+	if readErr != nil {
+		log.Printf("[instagram] не удалось прочитать файл сессии: %v", readErr)
+		return result, err
+	}
+	dir, mkErr := os.MkdirTemp("", "tg-video-*")
+	if mkErr != nil {
+		return nil, fmt.Errorf("не удалось создать директорию для сессии Instagram: %w", mkErr)
+	}
+	defer os.RemoveAll(dir)
+	copyPath := filepath.Join(dir, "cookies.txt")
+	if writeErr := os.WriteFile(copyPath, cookies, 0600); writeErr != nil {
+		return nil, fmt.Errorf("не удалось подготовить сессию Instagram: %w", writeErr)
+	}
+	log.Printf("[instagram] повторная попытка с авторизацией: url=%s", retryURL)
+	return downloadVideoFormats(ctx, retryURL, onProgress, copyPath)
+}
+
+func instagramLoginRetryURL(rawURL, message string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.User != nil || !instagramPostPath.MatchString(u.EscapedPath()) {
+		return ""
+	}
+	host := strings.ToLower(u.Host)
+	if host != "instagram.com" && host != "www.instagram.com" {
+		return ""
+	}
+	message = strings.ToLower(message)
+	if !strings.HasPrefix(message, "[instagram] ") ||
+		(!strings.Contains(message, "empty media response") && !strings.Contains(message, "login required")) {
+		return ""
+	}
+	return "https://www.instagram.com" + strings.TrimSuffix(u.Path, "/") + "/"
+}
+
+func downloadVideoFormats(ctx context.Context, url string, onProgress progressFunc, cookiesPath string) (*downloadResult, error) {
+	userAgent := ytDlpUserAgent()
 
 	// Один ринг лестницы = один запуск yt-dlp. Селектор, по порядку:
 	//  1) склейка avc1-видео со звуком через ffmpeg — так качаются ролики
@@ -1351,9 +1399,11 @@ func downloadVideo(parent context.Context, url string, onProgress progressFunc) 
 			"--progress-template",
 			"PROG:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s",
 			"--user-agent", userAgent,
-			"--",
-			url,
 		}
+		if cookiesPath != "" {
+			args = append(args, "--cookies", cookiesPath)
+		}
+		args = append(args, "--", url)
 
 		out, err := runYtDlpDownload(ctx, args, onProgress)
 		raw := strings.TrimSpace(out)

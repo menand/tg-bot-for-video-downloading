@@ -12,6 +12,30 @@ import (
 	"unicode/utf8"
 )
 
+func TestInstagramLoginRetryURL(t *testing.T) {
+	const emptyMedia = "[Instagram] abc: Instagram sent an empty media response."
+	const want = "https://www.instagram.com/reel/abc/"
+	for _, tc := range []struct {
+		name, link, message, want string
+	}{
+		{"ссылка с телефона", "https://instagram.com/reel/abc/?igsh=xyz", emptyMedia, want},
+		{"требуется вход", want, "[Instagram] abc: login required", want},
+		{"чужой домен", "https://instagram.com.example.org/reel/abc/", emptyMedia, ""},
+		{"другой порт", "https://instagram.com:8443/reel/abc/", emptyMedia, ""},
+		{"учётные данные в ссылке", "https://name@instagram.com/reel/abc/", emptyMedia, ""},
+		{"несанкционированный путь", "https://instagram.com/accounts/login/", emptyMedia, ""},
+		{"незащищённая ссылка", "http://instagram.com/reel/abc/", emptyMedia, ""},
+		{"ошибка другого сайта", want, "[generic] abc: login required", ""},
+		{"ошибка формата", want, "[Instagram] abc: requested format is not available", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := instagramLoginRetryURL(tc.link, tc.message); got != tc.want {
+				t.Fatalf("адрес повтора = %q, ожидался %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTruncateUTF8(t *testing.T) {
 	cases := []struct {
 		s    string
