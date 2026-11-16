@@ -13,10 +13,10 @@ RUN apk add --no-cache ca-certificates ffmpeg python3 py3-pip deno
 
 # yt-dlp через pip, а не PyInstaller-бинарём с GitHub: тот распаковывает себя
 # при каждом запуске (десятки секунд на слабом VPS), pip-версия стартует ~1с.
-# Формат версии у pip — 2026.8.19 (без ведущих нулей), а не тег релиза 2026.08.19.
+# Формат версии у pip — 2026.10.26 (без ведущих нулей в месяце и дне).
 # [default] обязателен: тянет yt-dlp-ejs (challenge solver скрипты) — без него
 # YouTube отдаёт "Signature solving failed" даже при наличии deno.
-ARG YT_DLP_VERSION=2026.8.19
+ARG YT_DLP_VERSION=2026.10.26
 RUN pip install --no-cache-dir --break-system-packages "yt-dlp[default]==${YT_DLP_VERSION}" && \
     yt-dlp --version
 
